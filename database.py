@@ -153,6 +153,56 @@ def init_db() -> None:
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS alignment_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_name TEXT NOT NULL,
+            core_ids TEXT NOT NULL,
+            method TEXT DEFAULT 'combined',
+            threshold REAL DEFAULT 0.6,
+            alignment_data TEXT,
+            continuity_data TEXT,
+            surface_data TEXT,
+            evolution_data TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS alignment_corrections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alignment_id INTEGER NOT NULL,
+            group_id INTEGER NOT NULL,
+            sample_code TEXT NOT NULL,
+            layer_id INTEGER NOT NULL,
+            original_depth_start REAL,
+            original_depth_end REAL,
+            corrected_depth_start REAL,
+            corrected_depth_end REAL,
+            correction_type TEXT DEFAULT 'manual',
+            correction_reason TEXT,
+            corrected_by TEXT DEFAULT 'geologist',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (alignment_id) REFERENCES alignment_results(id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS alignment_annotations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alignment_id INTEGER NOT NULL,
+            annotation_type TEXT NOT NULL,
+            target_type TEXT DEFAULT 'group',
+            target_id INTEGER,
+            content TEXT NOT NULL,
+            author TEXT DEFAULT 'geologist',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (alignment_id) REFERENCES alignment_results(id)
+        )
+    """)
+
     _migrate_existing_tables(cursor)
 
     conn.commit()
@@ -717,3 +767,142 @@ def get_layer_by_id(layer_id: int) -> Optional[Dict[str, Any]]:
     row = cursor.fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def save_alignment_result(session_name: str, core_ids: List[int], method: str = "combined",
+                          threshold: float = 0.6, alignment_data: str = "",
+                          continuity_data: str = "", surface_data: str = "",
+                          evolution_data: str = "") -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO alignment_results
+        (session_name, core_ids, method, threshold, alignment_data, continuity_data, surface_data, evolution_data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (session_name, json.dumps(core_ids), method, threshold,
+          alignment_data, continuity_data, surface_data, evolution_data))
+    result_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return result_id
+
+
+def get_alignment_results(limit: int = 20) -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql_query(
+        "SELECT * FROM alignment_results ORDER BY created_at DESC LIMIT ?",
+        conn, params=(limit,)
+    )
+    conn.close()
+    return df
+
+
+def get_alignment_result(alignment_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM alignment_results WHERE id = ?", (alignment_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def add_alignment_correction(alignment_id: int, group_id: int, sample_code: str,
+                             layer_id: int, original_depth_start: float,
+                             original_depth_end: float, corrected_depth_start: float,
+                             corrected_depth_end: float, correction_type: str = "manual",
+                             correction_reason: str = "", corrected_by: str = "geologist") -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO alignment_corrections
+        (alignment_id, group_id, sample_code, layer_id,
+         original_depth_start, original_depth_end,
+         corrected_depth_start, corrected_depth_end,
+         correction_type, correction_reason, corrected_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (alignment_id, group_id, sample_code, layer_id,
+          original_depth_start, original_depth_end,
+          corrected_depth_start, corrected_depth_end,
+          correction_type, correction_reason, corrected_by))
+    correction_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return correction_id
+
+
+def get_alignment_corrections(alignment_id: int) -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql_query(
+        "SELECT * FROM alignment_corrections WHERE alignment_id = ? ORDER BY created_at DESC",
+        conn, params=(alignment_id,)
+    )
+    conn.close()
+    return df
+
+
+def add_alignment_annotation(alignment_id: int, annotation_type: str, content: str,
+                             target_type: str = "group", target_id: int = None,
+                             author: str = "geologist") -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO alignment_annotations
+        (alignment_id, annotation_type, target_type, target_id, content, author)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (alignment_id, annotation_type, target_type, target_id, content, author))
+    annotation_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return annotation_id
+
+
+def get_alignment_annotations(alignment_id: int, annotation_type: str = None) -> pd.DataFrame:
+    conn = get_connection()
+    if annotation_type:
+        df = pd.read_sql_query(
+            "SELECT * FROM alignment_annotations WHERE alignment_id = ? AND annotation_type = ? ORDER BY created_at DESC",
+            conn, params=(alignment_id, annotation_type)
+        )
+    else:
+        df = pd.read_sql_query(
+            "SELECT * FROM alignment_annotations WHERE alignment_id = ? ORDER BY created_at DESC",
+            conn, params=(alignment_id,)
+        )
+    conn.close()
+    return df
+
+
+def delete_alignment_result(alignment_id: int) -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM alignment_corrections WHERE alignment_id = ?", (alignment_id,))
+    cursor.execute("DELETE FROM alignment_annotations WHERE alignment_id = ?", (alignment_id,))
+    cursor.execute("DELETE FROM alignment_results WHERE id = ?", (alignment_id,))
+    conn.commit()
+    conn.close()
+
+
+def update_alignment_result(alignment_id: int, **kwargs) -> None:
+    if not kwargs:
+        return
+    conn = get_connection()
+    cursor = conn.cursor()
+    set_clause = ", ".join([f"{k} = ?" for k in kwargs.keys()])
+    params = list(kwargs.values()) + [alignment_id]
+    cursor.execute(f"UPDATE alignment_results SET {set_clause}, updated_at = CURRENT_TIMESTAMP WHERE id = ?", params)
+    conn.commit()
+    conn.close()
+
+
+def get_correction_dicts(alignment_id: int) -> List[Dict[str, Any]]:
+    df = get_alignment_corrections(alignment_id)
+    if df.empty:
+        return []
+    return df.to_dict("records")
+
+
+def get_annotation_dicts(alignment_id: int, annotation_type: str = None) -> List[Dict[str, Any]]:
+    df = get_alignment_annotations(alignment_id, annotation_type)
+    if df.empty:
+        return []
+    return df.to_dict("records")

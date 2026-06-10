@@ -703,3 +703,878 @@ def plot_missing_severity_gauge(missing_pct: float, title: str = "数据完整�
     )
 
     return fig
+
+
+SURFACE_COLORS = {
+    "flooding_surface": "#1565C0",
+    "regression_surface": "#C62828",
+    "lithology_change": "#FF8F00",
+    "gradational_change": "#2E7D32",
+}
+
+ZONE_COLORS = {
+    "近源粗粒沉积区": "#8D6E63",
+    "滨岸砂质沉积区": "#F4A460",
+    "过渡带砂泥混合区": "#DAA520",
+    "深水泥质沉积区": "#5D4037",
+    "陆棚粉砂沉积区": "#BCAAA4",
+    "混合沉积区": "#9E9E9E",
+    "有机质富集区": "#2E7D32",
+}
+
+CONTINUITY_COLORS = {
+    "continuous": "#28a745",
+    "transitional": "#ffc107",
+    "discontinuous": "#dc3545",
+    "isolated": "#6c757d",
+}
+
+
+def plot_alignment_diagram(alignment_result: Dict[str, Any],
+                           title: str = "多柱样层位对齐图") -> go.Figure:
+    core_data = alignment_result.get("core_data", {})
+    aligned_groups = alignment_result.get("aligned_groups", [])
+
+    if not core_data:
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    sample_codes = list(core_data.keys())
+    n_cores = len(sample_codes)
+
+    all_max_depths = []
+    for code in sample_codes:
+        layers = core_data[code]["layers"]
+        if not layers.empty:
+            all_max_depths.append(layers["depth_end"].max())
+    global_max = max(all_max_depths) if all_max_depths else 100
+
+    fig = go.Figure()
+
+    x_positions = list(range(1, n_cores + 1))
+    spacing = 2.5
+
+    for core_idx, code in enumerate(sample_codes):
+        layers = core_data[code]["layers"]
+        if layers.empty:
+            continue
+        x_pos = core_idx * spacing + 1
+
+        for _, row in layers.iterrows():
+            thickness = row["depth_end"] - row["depth_start"]
+            color = _get_layer_color(row["layer_name"])
+
+            fig.add_trace(go.Bar(
+                x=[x_pos],
+                y=[-thickness],
+                base=[-row["depth_start"]],
+                orientation="v",
+                marker_color=color,
+                marker_line_color="black",
+                marker_line_width=1,
+                width=0.8,
+                name=row["layer_name"],
+                legendgroup=row["layer_name"],
+                showlegend=False,
+                hovertext=(
+                    f"柱样: {code}<br>"
+                    f"层位: {row['layer_name']}<br>"
+                    f"深度: {row['depth_start']} - {row['depth_end']} cm<br>"
+                    f"厚度: {thickness:.1f} cm"
+                ),
+                hoverinfo="text",
+            ))
+
+    alignment_colors = px.colors.qualitative.Set2
+    for group_idx, group in enumerate(aligned_groups):
+        color = alignment_colors[group_idx % len(alignment_colors)]
+        members = group["members"]
+
+        for m_idx in range(len(members) - 1):
+            m_a = members[m_idx]
+            m_b = members[m_idx + 1]
+
+            idx_a = sample_codes.index(m_a["sample_code"]) if m_a["sample_code"] in sample_codes else None
+            idx_b = sample_codes.index(m_b["sample_code"]) if m_b["sample_code"] in sample_codes else None
+
+            if idx_a is not None and idx_b is not None:
+                x_a = idx_a * spacing + 1
+                x_b = idx_b * spacing + 1
+
+                fig.add_trace(go.Scatter(
+                    x=[x_a + 0.4, x_b - 0.4],
+                    y=[-m_a["depth"], -m_b["depth"]],
+                    mode="lines",
+                    line=dict(color=color, width=2, dash="dot"),
+                    showlegend=False,
+                    hoverinfo="skip",
+                ))
+
+    for group_idx, group in enumerate(aligned_groups[:20]):
+        color = alignment_colors[group_idx % len(alignment_colors)]
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode="markers",
+            marker=dict(size=10, color=color, symbol="diamond"),
+            name=f"对齐组{group['group_id']}: {group['representative_name']}",
+            showlegend=True,
+        ))
+
+    fig.update_layout(
+        title=title,
+        barmode="overlay",
+        xaxis=dict(
+            tickmode="array",
+            tickvals=[i * spacing + 1 for i in range(n_cores)],
+            ticktext=sample_codes,
+            title="柱样编号",
+        ),
+        yaxis=dict(
+            title="深度 (cm)",
+            range=[-global_max - 10, 5],
+        ),
+        showlegend=True,
+        legend_title="对齐组",
+        height=700,
+        width=max(800, n_cores * 250),
+    )
+
+    return fig
+
+
+def plot_key_surface_tracking(surface_result: Dict[str, Any], core_data: Dict[str, Any],
+                               title: str = "关键界面追踪图") -> go.Figure:
+    key_surfaces = surface_result.get("key_surfaces", [])
+    correlations = surface_result.get("surface_correlations", [])
+
+    if not key_surfaces or not core_data:
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    sample_codes = list(core_data.keys())
+    n_cores = len(sample_codes)
+    spacing = 2.5
+
+    all_max_depths = []
+    for code in sample_codes:
+        layers = core_data[code]["layers"]
+        if not layers.empty:
+            all_max_depths.append(layers["depth_end"].max())
+    global_max = max(all_max_depths) if all_max_depths else 100
+
+    fig = go.Figure()
+
+    for core_idx, code in enumerate(sample_codes):
+        layers = core_data[code]["layers"]
+        if layers.empty:
+            continue
+        x_pos = core_idx * spacing + 1
+
+        for _, row in layers.iterrows():
+            thickness = row["depth_end"] - row["depth_start"]
+            color = _get_layer_color(row["layer_name"])
+            fig.add_trace(go.Bar(
+                x=[x_pos],
+                y=[-thickness],
+                base=[-row["depth_start"]],
+                orientation="v",
+                marker_color=color,
+                marker_line_color="black",
+                marker_line_width=1,
+                width=0.8,
+                showlegend=False,
+                hovertext=(
+                    f"柱样: {code}<br>"
+                    f"层位: {row['layer_name']}<br>"
+                    f"深度: {row['depth_start']} - {row['depth_end']} cm"
+                ),
+                hoverinfo="text",
+            ))
+
+    for surface in key_surfaces:
+        sc = surface["sample_code"]
+        if sc not in sample_codes:
+            continue
+        core_idx = sample_codes.index(sc)
+        x_pos = core_idx * spacing + 1
+
+        stype = surface["surface_type"]
+        marker_color = SURFACE_COLORS.get(stype, "#666666")
+
+        fig.add_trace(go.Scatter(
+            x=[x_pos - 0.5, x_pos + 0.5],
+            y=[-surface["depth"], -surface["depth"]],
+            mode="lines",
+            line=dict(color=marker_color, width=3),
+            showlegend=False,
+            hovertext=(
+                f"界面类型: {stype}<br>"
+                f"深度: {surface['depth']:.1f} cm<br>"
+                f"上覆: {surface['layer_above']}<br>"
+                f"下伏: {surface['layer_below']}"
+            ),
+            hoverinfo="text",
+        ))
+
+    for corr in correlations:
+        code_a = corr["core_a"]
+        code_b = corr["core_b"]
+        if code_a not in sample_codes or code_b not in sample_codes:
+            continue
+
+        idx_a = sample_codes.index(code_a)
+        idx_b = sample_codes.index(code_b)
+        x_a = idx_a * spacing + 1
+        x_b = idx_b * spacing + 1
+
+        stype = corr["surface_type"]
+        line_color = SURFACE_COLORS.get(stype, "#666666")
+
+        fig.add_trace(go.Scatter(
+            x=[x_a + 0.5, x_b - 0.5],
+            y=[-corr["depth_a"], -corr["depth_b"]],
+            mode="lines",
+            line=dict(color=line_color, width=2, dash="dash"),
+            showlegend=False,
+            hovertext=(
+                f"相关界面: {stype}<br>"
+                f"{code_a}: {corr['depth_a']:.1f} cm<br>"
+                f"{code_b}: {corr['depth_b']:.1f} cm<br>"
+                f"相关性: {corr['correlation_score']:.3f}"
+            ),
+            hoverinfo="text",
+        ))
+
+    for stype, color in SURFACE_COLORS.items():
+        count = sum(1 for s in key_surfaces if s["surface_type"] == stype)
+        if count > 0:
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None],
+                mode="lines",
+                line=dict(color=color, width=3),
+                name=f"{stype} ({count})",
+                showlegend=True,
+            ))
+
+    fig.update_layout(
+        title=title,
+        barmode="overlay",
+        xaxis=dict(
+            tickmode="array",
+            tickvals=[i * spacing + 1 for i in range(n_cores)],
+            ticktext=sample_codes,
+            title="柱样编号",
+        ),
+        yaxis=dict(
+            title="深度 (cm)",
+            range=[-global_max - 10, 5],
+        ),
+        showlegend=True,
+        legend_title="界面类型",
+        height=700,
+        width=max(800, n_cores * 250),
+    )
+
+    return fig
+
+
+def plot_regional_evolution_map(evolution_result: Dict[str, Any],
+                                 title: str = "区域沉积演化分区图") -> go.Figure:
+    zones = evolution_result.get("zones", [])
+    stages = evolution_result.get("evolution_stages", [])
+
+    if not zones and not stages:
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=["沉积分区", "演化趋势"],
+        column_widths=[0.5, 0.5],
+    )
+
+    if zones:
+        zone_names = [z["zone_type"] for z in zones]
+        zone_counts = [z["core_count"] for z in zones]
+        zone_colors = [ZONE_COLORS.get(z["zone_type"], "#999999") for z in zones]
+
+        fig.add_trace(go.Bar(
+            x=zone_names,
+            y=zone_counts,
+            marker_color=zone_colors,
+            text=[f"{z['avg_sand']:.0f}%砂" for z in zones],
+            textposition="outside",
+            name="柱样数",
+            hovertext=[
+                f"分区: {z['zone_type']}<br>"
+                f"柱样数: {z['core_count']}<br>"
+                f"平均砂: {z['avg_sand']:.1f}%<br>"
+                f"平均粉砂: {z['avg_silt']:.1f}%<br>"
+                f"平均黏土: {z['avg_clay']:.1f}%"
+                for z in zones
+            ],
+            hoverinfo="text",
+        ), row=1, col=1)
+
+    if stages:
+        sample_codes = [s["sample_code"] for s in stages]
+        trends = [s["overall_trend"] for s in stages]
+
+        trend_colors = []
+        for t in trends:
+            if "海退" in t:
+                trend_colors.append("#C62828")
+            elif "海进" in t:
+                trend_colors.append("#1565C0")
+            else:
+                trend_colors.append("#2E7D32")
+
+        fig.add_trace(go.Bar(
+            x=sample_codes,
+            y=[1] * len(sample_codes),
+            marker_color=trend_colors,
+            text=trends,
+            textposition="outside",
+            name="演化趋势",
+            hovertext=[
+                f"柱样: {s['sample_code']}<br>"
+                f"趋势: {s['overall_trend']}<br>"
+                f"阶段数: {len(s['segments'])}"
+                for s in stages
+            ],
+            hoverinfo="text",
+        ), row=1, col=2)
+
+    fig.update_layout(
+        title=title,
+        height=500,
+        showlegend=False,
+    )
+
+    return fig
+
+
+def plot_continuity_chart(continuity_result: Dict[str, Any],
+                           title: str = "层序延续性分析图") -> go.Figure:
+    continuity = continuity_result.get("continuity", [])
+    if not continuity:
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    layer_names = [c["layer_name"] for c in continuity]
+    confidences = [c["confidence"] for c in continuity]
+    cont_types = [c["continuity_type"] for c in continuity]
+    colors = [CONTINUITY_COLORS.get(ct, "#999") for ct in cont_types]
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Bar(
+        x=layer_names,
+        y=confidences,
+        marker_color=colors,
+        text=[f"{c:.2f}" for c in confidences],
+        textposition="outside",
+        hovertext=[
+            f"层位: {c['layer_name']}<br>"
+            f"类型: {c['continuity_type']}<br>"
+            f"置信度: {c['confidence']:.3f}<br>"
+            f"出现次数: {c['occurrence_count']}<br>"
+            f"涉及站位: {c['station_count']}"
+            for c in continuity
+        ],
+        hoverinfo="text",
+    ))
+
+    for ctype, color in CONTINUITY_COLORS.items():
+        count = sum(1 for c in continuity if c["continuity_type"] == ctype)
+        if count > 0:
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None],
+                mode="markers",
+                marker=dict(size=10, color=color, symbol="square"),
+                name=f"{ctype} ({count})",
+                showlegend=True,
+            ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="层位名称",
+        yaxis_title="延续性置信度",
+        yaxis=dict(range=[0, 1.1]),
+        height=500,
+    )
+
+    return fig
+
+
+def plot_similar_segments_heatmap(similar_result: Dict[str, Any],
+                                   title: str = "相似层段识别热力图") -> go.Figure:
+    segment_pairs = similar_result.get("segment_pairs", [])
+    if not segment_pairs:
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    all_segments = similar_result.get("similar_segments", [])
+
+    if not all_segments:
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    pair_labels = []
+    similarity_values = []
+    segment_labels = []
+
+    for seg in all_segments[:50]:
+        label = f"{seg['core_a']} vs {seg['core_b']}"
+        pair_labels.append(label)
+        similarity_values.append(seg["similarity"])
+        seg_label = (f"{seg['layers_a'][0]}... ↔ {seg['layers_b'][0]}...")
+        segment_labels.append(seg_label)
+
+    fig = go.Figure(go.Bar(
+        x=segment_labels,
+        y=similarity_values,
+        marker_color=[
+            "#28a745" if s >= 0.8 else "#ffc107" if s >= 0.6 else "#dc3545"
+            for s in similarity_values
+        ],
+        text=[f"{s:.3f}" for s in similarity_values],
+        textposition="outside",
+        hovertext=[
+            f"{seg['core_a']} vs {seg['core_b']}<br>"
+            f"深度A: {seg['start_depth_a']:.1f}-{seg['end_depth_a']:.1f} cm<br>"
+            f"深度B: {seg['start_depth_b']:.1f}-{seg['end_depth_b']:.1f} cm<br>"
+            f"相似度: {seg['similarity']:.4f}"
+            for seg in all_segments[:50]
+        ],
+        hoverinfo="text",
+    ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="层段",
+        yaxis_title="相似度",
+        yaxis=dict(range=[0, 1.1]),
+        height=500,
+    )
+
+    return fig
+
+
+def plot_cross_section_correlation(alignment_result: Dict[str, Any],
+                                     surface_result: Optional[Dict[str, Any]] = None,
+                                     title: str = "多柱样层序对比横断面图") -> go.Figure:
+    core_data = alignment_result.get("core_data", {})
+    aligned_groups = alignment_result.get("aligned_groups", [])
+
+    if not core_data:
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    sample_codes = list(core_data.keys())
+    n_cores = len(sample_codes)
+
+    all_max_depths = []
+    for code in sample_codes:
+        layers = core_data[code]["layers"]
+        if not layers.empty:
+            all_max_depths.append(layers["depth_end"].max())
+    global_max = max(all_max_depths) if all_max_depths else 100
+
+    fig = go.Figure()
+
+    spacing = 3.0
+    bar_width = 1.2
+
+    for core_idx, code in enumerate(sample_codes):
+        layers = core_data[code]["layers"]
+        if layers.empty:
+            continue
+        x_center = core_idx * spacing + 1
+
+        for _, row in layers.iterrows():
+            thickness = row["depth_end"] - row["depth_start"]
+            color = _get_layer_color(row["layer_name"])
+
+            fig.add_trace(go.Bar(
+                x=[x_center],
+                y=[-thickness],
+                base=[-row["depth_start"]],
+                orientation="v",
+                marker_color=color,
+                marker_line_color="black",
+                marker_line_width=1,
+                width=bar_width,
+                name=row["layer_name"],
+                legendgroup=row["layer_name"],
+                showlegend=False,
+                hovertext=(
+                    f"柱样: {code}<br>"
+                    f"层位: {row['layer_name']}<br>"
+                    f"深度: {row['depth_start']} - {row['depth_end']} cm<br>"
+                    f"厚度: {thickness:.1f} cm<br>"
+                    f"砂: {row.get('sand_pct', 0):.1f}%<br>"
+                    f"黏土: {row.get('clay_pct', 0):.1f}%"
+                ),
+                hoverinfo="text",
+            ))
+
+        fig.add_annotation(
+            x=x_center, y=5,
+            text=f"<b>{code}</b>",
+            showarrow=False,
+            font=dict(size=12),
+        )
+
+    alignment_colors = px.colors.qualitative.Set2
+    for group_idx, group in enumerate(aligned_groups):
+        color = alignment_colors[group_idx % len(alignment_colors)]
+        members = group["members"]
+
+        for m_idx in range(len(members)):
+            for m_jdx in range(m_idx + 1, len(members)):
+                m_a = members[m_idx]
+                m_b = members[m_jdx]
+
+                if m_a["sample_code"] not in sample_codes or m_b["sample_code"] not in sample_codes:
+                    continue
+
+                idx_a = sample_codes.index(m_a["sample_code"])
+                idx_b = sample_codes.index(m_b["sample_code"])
+                x_a = idx_a * spacing + 1
+                x_b = idx_b * spacing + 1
+
+                fig.add_trace(go.Scatter(
+                    x=[x_a + bar_width / 2, x_b - bar_width / 2],
+                    y=[-m_a["depth"], -m_b["depth"]],
+                    mode="lines",
+                    line=dict(color=color, width=1.5, dash="dot"),
+                    showlegend=False,
+                    hoverinfo="skip",
+                ))
+
+    if surface_result:
+        key_surfaces = surface_result.get("key_surfaces", [])
+        for surface in key_surfaces:
+            sc = surface["sample_code"]
+            if sc not in sample_codes:
+                continue
+            core_idx = sample_codes.index(sc)
+            x_center = core_idx * spacing + 1
+            stype = surface["surface_type"]
+            marker_color = SURFACE_COLORS.get(stype, "#666666")
+            marker_symbol = {
+                "flooding_surface": "triangle-up",
+                "regression_surface": "triangle-down",
+                "lithology_change": "diamond",
+                "gradational_change": "circle",
+            }.get(stype, "circle")
+
+            fig.add_trace(go.Scatter(
+                x=[x_center + bar_width / 2 + 0.15],
+                y=[-surface["depth"]],
+                mode="markers",
+                marker=dict(size=10, color=marker_color, symbol=marker_symbol,
+                            line=dict(width=1, color="black")),
+                showlegend=False,
+                hovertext=(
+                    f"{surface.get('surface_label', stype)}<br>"
+                    f"深度: {surface['depth']:.1f}cm<br>"
+                    f"上覆: {surface['layer_above']}<br>"
+                    f"下伏: {surface['layer_below']}"
+                ),
+                hoverinfo="text",
+            ))
+
+    unique_layers = set()
+    for code in sample_codes:
+        layers = core_data[code]["layers"]
+        if not layers.empty:
+            for _, row in layers.iterrows():
+                if row["layer_name"] not in unique_layers:
+                    unique_layers.add(row["layer_name"])
+                    fig.add_trace(go.Scatter(
+                        x=[None], y=[None],
+                        mode="markers",
+                        marker=dict(size=10, color=_get_layer_color(row["layer_name"]),
+                                    symbol="square"),
+                        name=row["layer_name"],
+                        showlegend=True,
+                    ))
+
+    fig.update_layout(
+        title=title,
+        barmode="overlay",
+        xaxis=dict(
+            tickmode="array",
+            tickvals=[i * spacing + 1 for i in range(n_cores)],
+            ticktext=sample_codes,
+            title="柱样编号",
+            range=[-0.5, n_cores * spacing + 0.5],
+        ),
+        yaxis=dict(
+            title="深度 (cm)",
+            range=[-global_max - 15, 15],
+        ),
+        showlegend=True,
+        legend_title="图例",
+        height=max(700, global_max * 3),
+        width=max(900, n_cores * 280),
+    )
+
+    return fig
+
+
+def plot_alignment_quality(quality: Dict[str, Any],
+                            title: str = "对齐质量评估") -> go.Figure:
+    if not quality or not quality.get("details"):
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    details = quality["details"]
+    categories = ["层位覆盖率", "多站位对齐率", "平均相似度", "同名匹配率"]
+    values = [
+        details.get("coverage_ratio", 0),
+        details.get("multi_station_group_ratio", 0),
+        details.get("avg_similarity", 0),
+        details.get("name_match_ratio", 0),
+    ]
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=["质量指标雷达图", "质量指标柱状图"],
+        column_widths=[0.5, 0.5],
+    )
+
+    fig.add_trace(go.Scatterpolar(
+        r=values + [values[0]],
+        theta=categories + [categories[0]],
+        fill="toself",
+        name="质量评分",
+        line=dict(color="#2d5f8f", width=2),
+        fillcolor="rgba(45, 95, 143, 0.3)",
+    ), row=1, col=1)
+
+    colors = ["#28a745" if v >= 0.7 else "#ffc107" if v >= 0.4 else "#dc3545" for v in values]
+    fig.add_trace(go.Bar(
+        x=categories,
+        y=values,
+        marker_color=colors,
+        text=[f"{v:.1%}" for v in values],
+        textposition="outside",
+        name="评分",
+    ), row=1, col=2)
+
+    fig.update_layout(
+        title=f"{title} - 总评分: {quality.get('overall_score', 0):.3f} ({quality.get('grade', 'N/A')})",
+        polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
+        height=500,
+        showlegend=False,
+    )
+    fig.update_yaxes(range=[0, 1.2], row=1, col=2)
+
+    return fig
+
+
+def plot_regional_evolution_detailed(evolution_result: Dict[str, Any],
+                                      title: str = "区域沉积演化综合分析图") -> go.Figure:
+    zones = evolution_result.get("zones", [])
+    stages = evolution_result.get("evolution_stages", [])
+    core_data = evolution_result.get("core_data", {})
+
+    if not zones and not stages:
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    fig = make_subplots(
+        rows=2, cols=3,
+        subplot_titles=["沉积分区", "演化趋势", "颗粒组成对比",
+                         "砂黏比垂直变化", "沉积环境三角图", "分区柱样统计"],
+        vertical_spacing=0.15,
+        horizontal_spacing=0.1,
+    )
+
+    if zones:
+        zone_names = [z["zone_type"] for z in zones]
+        zone_counts = [z["core_count"] for z in zones]
+        zone_colors = [ZONE_COLORS.get(z["zone_type"], "#999999") for z in zones]
+
+        fig.add_trace(go.Bar(
+            x=zone_names, y=zone_counts,
+            marker_color=zone_colors,
+            text=[f"{z['avg_sand']:.0f}%砂" for z in zones],
+            textposition="outside",
+            name="柱样数",
+        ), row=1, col=1)
+
+    if stages:
+        sample_codes = [s["sample_code"] for s in stages]
+        trends = [s["overall_trend"] for s in stages]
+        trend_colors = []
+        for t in trends:
+            if "海退" in t:
+                trend_colors.append("#C62828")
+            elif "海进" in t:
+                trend_colors.append("#1565C0")
+            else:
+                trend_colors.append("#2E7D32")
+
+        fig.add_trace(go.Bar(
+            x=sample_codes, y=[1] * len(sample_codes),
+            marker_color=trend_colors,
+            text=trends,
+            textposition="outside",
+            name="演化趋势",
+        ), row=1, col=2)
+
+    if zones:
+        sand_vals = [z["avg_sand"] for z in zones]
+        silt_vals = [z["avg_silt"] for z in zones]
+        clay_vals = [z["avg_clay"] for z in zones]
+
+        fig.add_trace(go.Bar(
+            x=["砂", "粉砂", "黏土"],
+            y=[np.mean(sand_vals), np.mean(silt_vals), np.mean(clay_vals)],
+            marker_color=["#f4a460", "#daa520", "#8b4513"],
+            name="平均颗粒组成",
+        ), row=1, col=3)
+
+    if core_data and stages:
+        colors_list = px.colors.qualitative.Plotly
+        for idx, (code, data) in enumerate(core_data.items()):
+            layers = data["layers"].sort_values("depth_start")
+            if layers.empty:
+                continue
+            sand_clay_ratio = layers["sand_pct"] / layers["clay_pct"].replace(0, 0.1)
+            mid_depth = (layers["depth_start"] + layers["depth_end"]) / 2
+
+            fig.add_trace(go.Scatter(
+                x=sand_clay_ratio,
+                y=-mid_depth,
+                mode="lines+markers",
+                name=code,
+                line=dict(color=colors_list[idx % len(colors_list)], width=2),
+                marker=dict(size=5),
+            ), row=2, col=1)
+
+        fig.update_xaxes(title_text="砂黏比", row=2, col=1)
+        fig.update_yaxes(title_text="深度 (cm)", row=2, col=1)
+
+    if core_data:
+        all_sand = []
+        all_clay = []
+        all_silt = []
+        all_codes = []
+        for code, data in core_data.items():
+            layers = data["layers"]
+            if not layers.empty:
+                all_sand.extend(layers["sand_pct"].tolist())
+                all_clay.extend(layers["clay_pct"].tolist())
+                all_silt.extend(layers["silt_pct"].tolist())
+                all_codes.extend([code] * len(layers))
+
+        if all_sand:
+            fig.add_trace(go.Scatterternary({
+                "mode": "markers",
+                "a": all_sand,
+                "b": all_clay,
+                "c": all_silt,
+                "text": all_codes,
+                "marker": {
+                    "size": 8,
+                    "color": all_codes,
+                    "line": {"width": 1, "color": "black"},
+                },
+                "name": "颗粒组成",
+            }), row=2, col=2)
+
+    if zones:
+        zone_names = [z["zone_type"] for z in zones]
+        zone_core_counts = [z["core_count"] for z in zones]
+        zone_colors_bar = [ZONE_COLORS.get(z["zone_type"], "#999") for z in zones]
+
+        fig.add_trace(go.Pie(
+            labels=zone_names,
+            values=zone_core_counts,
+            marker=dict(colors=zone_colors_bar),
+            textinfo="label+percent",
+            name="分区占比",
+        ), row=2, col=3)
+
+    fig.update_layout(
+        title=title,
+        height=900,
+        showlegend=False,
+    )
+
+    return fig
+
+
+def plot_surface_significance_chart(surface_result: Dict[str, Any],
+                                      title: str = "关键界面重要性分析") -> go.Figure:
+    key_surfaces = surface_result.get("key_surfaces", [])
+    if not key_surfaces:
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    sample_codes = [s["sample_code"] for s in key_surfaces]
+    depths = [s["depth"] for s in key_surfaces]
+    grain_changes = [s.get("grain_change", 0) for s in key_surfaces]
+    significance = [s.get("significance", "low") for s in key_surfaces]
+
+    sig_colors = {"high": "#dc3545", "medium": "#ffc107", "low": "#28a745"}
+    colors = [sig_colors.get(s, "#999") for s in significance]
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=sample_codes,
+        y=depths,
+        mode="markers",
+        marker=dict(
+            size=[gc / 3 + 8 for gc in grain_changes],
+            color=colors,
+            symbol=["triangle-up" if s.get("surface_type") == "flooding_surface" else
+                     "triangle-down" if s.get("surface_type") == "regression_surface" else
+                     "diamond" for s in key_surfaces],
+            line=dict(width=1, color="black"),
+        ),
+        text=[f"{s.get('surface_label', s['surface_type'])}<br>"
+              f"深度: {s['depth']:.1f}cm<br>"
+              f"粒度变化: {s.get('grain_change', 0):.1f}<br>"
+              f"重要性: {s.get('significance', 'low')}"
+              for s in key_surfaces],
+        hoverinfo="text",
+        name="界面",
+    ))
+
+    for sig_level, color in sig_colors.items():
+        label_map = {"high": "高重要性", "medium": "中等重要性", "low": "低重要性"}
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode="markers",
+            marker=dict(size=10, color=color, symbol="diamond"),
+            name=label_map.get(sig_level, sig_level),
+            showlegend=True,
+        ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="柱样编号",
+        yaxis_title="深度 (cm)",
+        yaxis=dict(autorange="reversed"),
+        height=600,
+        showlegend=True,
+    )
+
+    return fig

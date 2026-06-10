@@ -12,6 +12,7 @@ import data_validator as validator
 import analyzer
 import visualizer
 import quality_control as qc
+import alignment_engine as align
 
 
 st.set_page_config(
@@ -106,6 +107,7 @@ with st.sidebar:
             "📥 数据导入与去重",
             "🔬 单柱样分析",
             "📈 多柱样对比",
+            "🔗 层位对齐与区域演化",
             "🎯 质量控制工作台",
             "⚙️ 数据管理与版本"
         ]
@@ -1016,6 +1018,804 @@ elif page == "📈 多柱样对比":
                     st.write("- 各柱样指标对比")
                     st.write("- 各层位类型统计")
                     st.write("- 异常数据汇总")
+
+
+elif page == "🔗 层位对齐与区域演化":
+    st.header("层位对齐与区域沉积演化解释")
+
+    filters = st.session_state.filters
+    cores_df = analyzer.filter_cores(filters)
+
+    if cores_df.empty:
+        st.info("暂无符合筛选条件的沉积柱样数据，请先导入CSV文件或调整筛选条件。")
+    else:
+        col_select_mode, col_station = st.columns([1, 2])
+        with col_select_mode:
+            alignment_mode = st.radio(
+                "选择柱样方式",
+                ["跨站位选择", "按站位选择"],
+                horizontal=True,
+                help="层位对齐支持跨站位对比，不同站位柱样可通过归一化深度进行对齐"
+            )
+
+        selected_alignment_cores = []
+        if alignment_mode == "按站位选择":
+            station_grouped = cores_df.groupby("station_code")["sample_code"].apply(list).to_dict()
+            if station_grouped:
+                sel_station = st.selectbox(
+                    "选择站位",
+                    list(station_grouped.keys()),
+                    key="align_station_select"
+                )
+                selected_alignment_cores = station_grouped[sel_station]
+                if len(selected_alignment_cores) < 2:
+                    st.warning("该站位下柱样数量不足2个")
+            else:
+                st.info("暂无站位数据")
+        else:
+            selected_alignment_cores = st.multiselect(
+                "选择要对齐的柱样（至少2个）",
+                cores_df["sample_code"].tolist(),
+                key="align_core_multiselect"
+            )
+            if len(selected_alignment_cores) < 2:
+                st.warning("请至少选择2个柱样进行对齐分析")
+
+        if len(selected_alignment_cores) >= 2:
+            core_id_map = dict(zip(cores_df["sample_code"], cores_df["id"]))
+            selected_core_ids = [core_id_map[code] for code in selected_alignment_cores if code in core_id_map]
+
+            if len(selected_core_ids) >= 2:
+                st.success(f"✅ 已选择 {len(selected_alignment_cores)} 个柱样进行层位对齐分析")
+
+                col_method, col_threshold, col_depth_tol = st.columns(3)
+                with col_method:
+                    align_method = st.selectbox(
+                        "对齐方法",
+                        ["combined", "lithology", "depth", "dtw"],
+                        format_func=lambda x: {
+                            "combined": "综合对齐（岩性+深度）",
+                            "lithology": "岩性相似性对齐",
+                            "depth": "深度归一化对齐",
+                            "dtw": "DTW动态时间规整对齐",
+                        }.get(x, x),
+                        key="align_method_select"
+                    )
+                with col_threshold:
+                    sim_threshold = st.slider(
+                        "相似度阈值",
+                        min_value=0.3, max_value=0.95, value=0.6, step=0.05,
+                        help="低于此阈值的层位对不会被视为对齐",
+                        key="align_threshold"
+                    )
+                with col_depth_tol:
+                    depth_tolerance = st.slider(
+                        "深度容差 (cm)",
+                        min_value=1, max_value=50, value=10, step=5,
+                        help="归一化深度差在此范围内的层位优先匹配",
+                        key="align_depth_tol"
+                    )
+
+                with st.expander("⚙️ 高级参数设置"):
+                    st.subheader("指标权重配置")
+                    st.caption("调整不同指标在相似度计算中的权重，权重越大该指标影响越大")
+
+                    indicator_weight_config = {}
+                    weight_cols = st.columns(3)
+                    indicator_display = {
+                        "gravel_pct": "砾石含量",
+                        "sand_pct": "砂含量",
+                        "silt_pct": "粉砂含量",
+                        "clay_pct": "黏土含量",
+                        "organic_matter": "有机质含量",
+                        "water_content": "含水率",
+                    }
+                    default_weights = align.DEFAULT_INDICATOR_WEIGHTS
+                    for idx, (ind_key, ind_name) in enumerate(indicator_display.items()):
+                        with weight_cols[idx % 3]:
+                            indicator_weight_config[ind_key] = st.slider(
+                                ind_name, min_value=0.0, max_value=3.0,
+                                value=default_weights.get(ind_key, 1.0), step=0.1,
+                                key=f"weight_{ind_key}"
+                            )
+
+                    enforce_strat_order = st.checkbox(
+                        "启用层序约束",
+                        value=True,
+                        help="约束对齐结果必须符合地层层序规律，位置差异大的层位将被惩罚",
+                        key="enforce_strat_order"
+                    )
+
+                if st.button("🔄 执行层位对齐分析", type="primary", use_container_width=True):
+                    with st.spinner("正在进行层位对齐分析..."):
+                        alignment_result = align.align_horizons(
+                            selected_core_ids,
+                            method=align_method,
+                            similarity_threshold=sim_threshold,
+                            depth_tolerance=depth_tolerance,
+                            indicator_weights=indicator_weight_config if any(
+                                v != default_weights.get(k, 1.0) for k, v in indicator_weight_config.items()
+                            ) else None,
+                            enforce_stratigraphic_order=enforce_strat_order,
+                        )
+                        continuity_result = align.analyze_sequence_continuity(selected_core_ids)
+                        surface_result = align.track_key_surfaces(selected_core_ids, depth_tolerance=depth_tolerance)
+                        evolution_result = align.regional_evolution_analysis(selected_core_ids)
+
+                        st.session_state.alignment_result = alignment_result
+                        st.session_state.continuity_result = continuity_result
+                        st.session_state.surface_result = surface_result
+                        st.session_state.evolution_result = evolution_result
+                        st.session_state.alignment_core_ids = selected_core_ids
+
+                        session_name = f"对齐_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                        alignment_id = db.save_alignment_result(
+                            session_name=session_name,
+                            core_ids=selected_core_ids,
+                            method=align_method,
+                            threshold=sim_threshold,
+                            alignment_data=json.dumps({
+                                "aligned_groups": alignment_result.get("aligned_groups", []),
+                                "unaligned_layers": alignment_result.get("unaligned_layers", []),
+                                "quality": alignment_result.get("quality", {}),
+                            }, default=str),
+                            continuity_data=json.dumps({
+                                "continuity_score": continuity_result.get("continuity_score", 0),
+                                "total_layer_types": continuity_result.get("total_layer_types", 0),
+                            }, default=str),
+                            surface_data=json.dumps({
+                                "surface_type_summary": surface_result.get("surface_type_summary", {}),
+                            }, default=str),
+                            evolution_data=json.dumps({
+                                "zones": evolution_result.get("zones", []),
+                                "summary": evolution_result.get("summary", {}),
+                            }, default=str),
+                        )
+                        st.session_state.current_alignment_id = alignment_id
+                        st.success(f"✅ 层位对齐分析完成！对齐会话ID: {alignment_id}")
+
+                if "alignment_result" in st.session_state:
+                    a_result = st.session_state.alignment_result
+                    c_result = st.session_state.get("continuity_result", {})
+                    s_result = st.session_state.get("surface_result", {})
+                    e_result = st.session_state.get("evolution_result", {})
+
+                    col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+                    with col_m1:
+                        st.metric("对齐组数", len(a_result.get("aligned_groups", [])))
+                    with col_m2:
+                        st.metric("延续性评分", f"{c_result.get('continuity_score', 0):.3f}")
+                    with col_m3:
+                        st.metric("关键界面", len(s_result.get("key_surfaces", [])))
+                    with col_m4:
+                        st.metric("沉积分区", len(e_result.get("zones", [])))
+                    with col_m5:
+                        quality = a_result.get("quality", {})
+                        if quality:
+                            grade_color = "🟢" if "A" in quality.get("grade", "") else "🟡" if "B" in quality.get("grade", "") else "🔴"
+                            st.metric("对齐质量", f"{grade_color} {quality.get('grade', 'N/A')}",
+                                      delta=f"评分 {quality.get('overall_score', 0):.3f}")
+                        else:
+                            st.metric("对齐质量", "N/A")
+
+                    if quality and quality.get("overall_score", 0) < 0.4:
+                        st.warning("⚠️ 对齐质量较低，建议调整相似度阈值、对齐方法或指标权重后重新分析")
+
+                    align_tab1, align_tab2, align_tab3, align_tab4, align_tab5, align_tab6, align_tab7, align_tab8, align_tab9 = st.tabs([
+                        "🗺️ 层序对比横断面", "🔗 层位对齐图", "📊 对齐质量评估",
+                        "📋 对齐结果详情", "📊 相似层段识别",
+                        "📏 层序延续性", "🌊 关键界面追踪", "🗺️ 区域演化分区",
+                        "✏️ 人工校正与备注"
+                    ])
+
+                    with align_tab1:
+                        st.subheader("多柱样层序对比横断面图")
+                        st.caption("综合展示柱样分层、层位对齐关系与关键界面追踪，是地质对比的核心图件")
+
+                        fig_cross = visualizer.plot_cross_section_correlation(
+                            a_result, surface_result=s_result,
+                            title="层序对比横断面图"
+                        )
+                        st.plotly_chart(fig_cross, use_container_width=True)
+
+                        st.info("💡 横断面图综合展示了柱样分层剖面、对齐层位连接线和关键界面标记，"
+                                "虚线连接表示对齐的层位，三角形标记表示关键界面位置")
+
+                    with align_tab2:
+                        st.subheader("多柱样层位对齐图")
+                        fig_align = visualizer.plot_alignment_diagram(
+                            a_result, title="层位自动对齐结果"
+                        )
+                        st.plotly_chart(fig_align, use_container_width=True)
+
+                        if a_result.get("unaligned_layers"):
+                            with st.expander(f"未对齐层位 ({len(a_result['unaligned_layers'])} 个)"):
+                                unaligned_df = pd.DataFrame(a_result["unaligned_layers"])
+                                st.dataframe(unaligned_df, use_container_width=True, hide_index=True)
+
+                    with align_tab4:
+                        st.subheader("对齐结果详情")
+                        aligned_groups = a_result.get("aligned_groups", [])
+
+                        if aligned_groups:
+                            group_rows = []
+                            for group in aligned_groups:
+                                for member in group["members"]:
+                                    group_rows.append({
+                                        "对齐组ID": group["group_id"],
+                                        "代表名称": group["representative_name"],
+                                        "柱样编号": member["sample_code"],
+                                        "层位名称": member["layer_name"],
+                                        "深度(cm)": round(member["depth"], 1),
+                                        "归一化深度": round(member["norm_depth"], 4),
+                                        "相似度": round(group["avg_similarity"], 4),
+                                        "涉及站位数": group["station_count"],
+                                    })
+                            group_df = pd.DataFrame(group_rows)
+                            st.dataframe(group_df, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("未识别到对齐层位，请调整相似度阈值或对齐方法后重试")
+
+                        all_alignments = a_result.get("alignments", [])
+                        if all_alignments:
+                            with st.expander(f"原始对齐对 ({len(all_alignments)} 对)"):
+                                align_pair_df = pd.DataFrame(all_alignments)
+                                display_cols = [c for c in [
+                                    "core_a", "core_b", "layer_name_a", "layer_name_b",
+                                    "depth_a", "depth_b", "similarity", "combined_score", "layer_name_match"
+                                ] if c in align_pair_df.columns]
+                                align_display = align_pair_df[display_cols].copy()
+                                align_display.columns = [
+                                    "柱样A", "柱样B", "层位A", "层位B",
+                                    "深度A", "深度B", "相似度", "综合评分", "同名匹配"
+                                ]
+                                st.dataframe(align_display.round(4), use_container_width=True, hide_index=True)
+
+                    with align_tab5:
+                        st.subheader("相似层段识别")
+
+                        col_w1, col_t1 = st.columns(2)
+                        with col_w1:
+                            window_size = st.slider("滑动窗口大小", min_value=2, max_value=6, value=3, step=1,
+                                                     key="sim_window_size")
+                        with col_t1:
+                            seg_threshold = st.slider("相似度阈值", min_value=0.5, max_value=0.95, value=0.7, step=0.05,
+                                                       key="sim_seg_threshold")
+
+                        if st.button("🔍 识别相似层段", key="run_similar_segments"):
+                            with st.spinner("正在识别相似层段..."):
+                                similar_result = align.find_similar_segments(
+                                    st.session_state.alignment_core_ids,
+                                    window_size=window_size,
+                                    similarity_threshold=seg_threshold
+                                )
+                                st.session_state.similar_result = similar_result
+
+                        if "similar_result" in st.session_state:
+                            sim_res = st.session_state.similar_result
+                            st.metric("识别到相似层段", sim_res.get("total_similar", 0))
+
+                            fig_sim = visualizer.plot_similar_segments_heatmap(
+                                sim_res, title="相似层段识别结果"
+                            )
+                            st.plotly_chart(fig_sim, use_container_width=True)
+
+                            segment_pairs = sim_res.get("segment_pairs", [])
+                            if segment_pairs:
+                                for pair in segment_pairs:
+                                    with st.expander(f"{pair['core_a']} vs {pair['core_b']} ({pair['segment_count']} 段)"):
+                                        seg_rows = []
+                                        for seg in pair["segments"]:
+                                            seg_rows.append({
+                                                "柱样A深度": f"{seg['start_depth_a']:.1f}-{seg['end_depth_a']:.1f}",
+                                                "柱样B深度": f"{seg['start_depth_b']:.1f}-{seg['end_depth_b']:.1f}",
+                                                "层位A": " → ".join(seg["layers_a"]),
+                                                "层位B": " → ".join(seg["layers_b"]),
+                                                "相似度": f"{seg['similarity']:.4f}",
+                                            })
+                                        st.dataframe(pd.DataFrame(seg_rows), use_container_width=True, hide_index=True)
+
+                    with align_tab6:
+                        st.subheader("层序延续性分析")
+
+                        if c_result:
+                            fig_cont = visualizer.plot_continuity_chart(
+                                c_result, title="各层位延续性分析"
+                            )
+                            st.plotly_chart(fig_cont, use_container_width=True)
+
+                            cont_data = c_result.get("continuity", [])
+                            if cont_data:
+                                cont_rows = []
+                                for c in cont_data:
+                                    row = {
+                                        "层位名称": c["layer_name"],
+                                        "延续类型": c["continuity_type"],
+                                        "置信度": f"{c['confidence']:.4f}",
+                                        "出现次数": c["occurrence_count"],
+                                        "涉及站位": c["station_count"],
+                                    }
+                                    if c.get("depth_range"):
+                                        row["归一化起点均值"] = f"{c['depth_range']['norm_start_mean']:.4f}"
+                                        row["归一化终点均值"] = f"{c['depth_range']['norm_end_mean']:.4f}"
+                                        row["起点标准差"] = f"{c['depth_range']['start_std']:.4f}"
+                                        row["终点标准差"] = f"{c['depth_range']['end_std']:.4f}"
+                                    cont_rows.append(row)
+                                st.dataframe(pd.DataFrame(cont_rows), use_container_width=True, hide_index=True)
+
+                            cont_type_labels = {
+                                "continuous": "连续（站位间稳定延续）",
+                                "transitional": "过渡（站位间有变化）",
+                                "discontinuous": "不连续（站位间差异大）",
+                                "isolated": "孤立（仅单站出现）",
+                            }
+                            st.info(
+                                f"💡 延续性解读：整体评分 {c_result.get('continuity_score', 0):.3f}，"
+                                f"连续层位 {c_result.get('continuous_count', 0)} 种，"
+                                f"过渡层位 {c_result.get('transitional_count', 0)} 种，"
+                                f"不连续层位 {c_result.get('discontinuous_count', 0)} 种"
+                            )
+
+                    with align_tab7:
+                        st.subheader("关键界面追踪")
+
+                        if s_result:
+                            fig_surface = visualizer.plot_key_surface_tracking(
+                                s_result,
+                                a_result.get("core_data", {}),
+                                title="关键界面追踪与相关性"
+                            )
+                            st.plotly_chart(fig_surface, use_container_width=True)
+
+                            fig_sig = visualizer.plot_surface_significance_chart(
+                                s_result, title="关键界面重要性分析"
+                            )
+                            st.plotly_chart(fig_sig, use_container_width=True)
+
+                            key_surfaces = s_result.get("key_surfaces", [])
+                            if key_surfaces:
+                                surface_rows = []
+                                for s in key_surfaces:
+                                    surface_rows.append({
+                                        "柱样": s["sample_code"],
+                                        "深度(cm)": f"{s['depth']:.1f}",
+                                        "界面类型": s.get("surface_label", s["surface_type"]),
+                                        "上覆层位": s["layer_above"],
+                                        "下伏层位": s["layer_below"],
+                                        "粒度变化": f"{s['grain_change']:.1f}",
+                                        "重要性": s.get("significance", "low"),
+                                    })
+                                st.dataframe(pd.DataFrame(surface_rows), use_container_width=True, hide_index=True)
+
+                            correlations = s_result.get("surface_correlations", [])
+                            if correlations:
+                                st.subheader("界面间相关性")
+                                corr_rows = []
+                                for corr in correlations:
+                                    corr_rows.append({
+                                        "界面类型": corr.get("surface_label", corr.get("surface_type", "")),
+                                        "柱样A": corr["core_a"],
+                                        "深度A": f"{corr['depth_a']:.1f}",
+                                        "柱样B": corr["core_b"],
+                                        "深度B": f"{corr['depth_b']:.1f}",
+                                        "深度相关": f"{corr['correlation_score']:.4f}",
+                                        "综合相关": f"{corr.get('combined_correlation', corr['correlation_score']):.4f}",
+                                    })
+                                st.dataframe(pd.DataFrame(corr_rows), use_container_width=True, hide_index=True)
+
+                    with align_tab8:
+                        st.subheader("区域沉积演化分区展示")
+
+                        if e_result:
+                            fig_evo = visualizer.plot_regional_evolution_map(
+                                e_result, title="区域沉积演化分区"
+                            )
+                            st.plotly_chart(fig_evo, use_container_width=True)
+
+                            fig_evo_detail = visualizer.plot_regional_evolution_detailed(
+                                e_result, title="区域沉积演化综合分析"
+                            )
+                            st.plotly_chart(fig_evo_detail, use_container_width=True)
+
+                            zones = e_result.get("zones", [])
+                            if zones:
+                                st.subheader("沉积分区详情")
+                                zone_rows = []
+                                for z in zones:
+                                    zone_rows.append({
+                                        "分区类型": z["zone_type"],
+                                        "柱样数": z["core_count"],
+                                        "涉及柱样": ", ".join(z.get("sample_codes", [])),
+                                        "平均砂(%)": z["avg_sand"],
+                                        "平均粉砂(%)": z["avg_silt"],
+                                        "平均黏土(%)": z["avg_clay"],
+                                        "平均砾石(%)": z["avg_gravel"],
+                                    })
+                                st.dataframe(pd.DataFrame(zone_rows), use_container_width=True, hide_index=True)
+
+                            stages = e_result.get("evolution_stages", [])
+                            if stages:
+                                st.subheader("各柱样演化阶段推断")
+                                for stage in stages:
+                                    with st.expander(f"📊 {stage['sample_code']}: {stage['overall_trend']}"):
+                                        seg_rows = []
+                                        for seg in stage["segments"]:
+                                            seg_rows.append({
+                                                "阶段": seg["segment"],
+                                                "深度范围(cm)": seg["depth_range"],
+                                                "平均砂(%)": seg["avg_sand"],
+                                                "平均黏土(%)": seg["avg_clay"],
+                                                "砂黏比": seg["sand_clay_ratio"],
+                                                "沉积环境": seg["environment"],
+                                                "层位组成": " → ".join(seg["layer_names"]),
+                                            })
+                                        st.dataframe(pd.DataFrame(seg_rows), use_container_width=True, hide_index=True)
+                                        trend_labels = {
+                                            "海退序列（变浅）": "🔴 海退：沉积环境由深变浅，砂含量向上增加",
+                                            "海进序列（变深）": "🔵 海进：沉积环境由浅变深，黏土含量向上增加",
+                                            "稳定沉积": "🟢 稳定：沉积环境基本不变，粒度组成稳定",
+                                        }
+                                        st.info(trend_labels.get(stage["overall_trend"], stage["overall_trend"]))
+
+                    with align_tab9:
+                        st.subheader("人工校正与解释备注")
+
+                        current_alignment_id = st.session_state.get("current_alignment_id")
+                        if not current_alignment_id:
+                            st.info("请先执行层位对齐分析后再进行人工校正")
+                        else:
+                            correction_tab, annotation_tab, history_tab = st.tabs([
+                                "✏️ 深度校正", "📝 解释备注", "📜 校正历史"
+                            ])
+
+                            with correction_tab:
+                                st.subheader("层位深度校正")
+                                aligned_groups = a_result.get("aligned_groups", [])
+
+                                if aligned_groups:
+                                    group_options = []
+                                    for group in aligned_groups:
+                                        label = f"组{group['group_id']}: {group['representative_name']} ({group['station_count']}站)"
+                                        group_options.append((label, group["group_id"]))
+
+                                    sel_group_label = st.selectbox(
+                                        "选择对齐组",
+                                        [g[0] for g in group_options],
+                                        key="correct_group_select"
+                                    )
+                                    sel_group_id = dict(group_options)[sel_group_label]
+
+                                    sel_group = next((g for g in aligned_groups if g["group_id"] == sel_group_id), None)
+                                    if sel_group:
+                                        member_options = [
+                                            f"{m['sample_code']} - {m['layer_name']} ({m['depth']:.1f}cm)"
+                                            for m in sel_group["members"]
+                                        ]
+                                        sel_member_label = st.selectbox(
+                                            "选择要校正的层位",
+                                            member_options,
+                                            key="correct_member_select"
+                                        )
+                                        sel_member_idx = member_options.index(sel_member_label)
+                                        sel_member = sel_group["members"][sel_member_idx]
+
+                                        layer_data = db.get_layer_by_id(sel_member["layer_id"])
+                                        if layer_data:
+                                            st.info(f"当前深度: {layer_data['depth_start']:.1f} - {layer_data['depth_end']:.1f} cm")
+
+                                            col_corr1, col_corr2 = st.columns(2)
+                                            with col_corr1:
+                                                new_depth_start = st.number_input(
+                                                    "校正后深度起点 (cm)",
+                                                    value=float(layer_data["depth_start"]),
+                                                    min_value=0.0,
+                                                    key="correct_depth_start"
+                                                )
+                                            with col_corr2:
+                                                new_depth_end = st.number_input(
+                                                    "校正后深度终点 (cm)",
+                                                    value=float(layer_data["depth_end"]),
+                                                    min_value=0.0,
+                                                    key="correct_depth_end"
+                                                )
+
+                                            correction_reason = st.text_input(
+                                                "校正原因",
+                                                placeholder="说明校正依据（如：根据相邻站位层位对比调整）",
+                                                key="correct_reason"
+                                            )
+                                            corrected_by = st.text_input("校正人", value="地质员", key="corrected_by")
+
+                                            if st.button("✅ 提交校正", key="submit_correction"):
+                                                if not correction_reason.strip():
+                                                    st.warning("请填写校正原因")
+                                                elif new_depth_start >= new_depth_end:
+                                                    st.error("深度起点必须小于终点")
+                                                else:
+                                                    db.add_alignment_correction(
+                                                        alignment_id=current_alignment_id,
+                                                        group_id=sel_group_id,
+                                                        sample_code=sel_member["sample_code"],
+                                                        layer_id=sel_member["layer_id"],
+                                                        original_depth_start=float(layer_data["depth_start"]),
+                                                        original_depth_end=float(layer_data["depth_end"]),
+                                                        corrected_depth_start=new_depth_start,
+                                                        corrected_depth_end=new_depth_end,
+                                                        correction_reason=correction_reason,
+                                                        corrected_by=corrected_by,
+                                                    )
+                                                    db.update_layer_with_version(
+                                                        sel_member["layer_id"],
+                                                        {
+                                                            "layer_name": layer_data["layer_name"],
+                                                            "depth_start": new_depth_start,
+                                                            "depth_end": new_depth_end,
+                                                            "gravel_pct": layer_data["gravel_pct"] or 0,
+                                                            "sand_pct": layer_data["sand_pct"] or 0,
+                                                            "silt_pct": layer_data["silt_pct"] or 0,
+                                                            "clay_pct": layer_data["clay_pct"] or 0,
+                                                            "organic_matter": layer_data["organic_matter"],
+                                                            "water_content": layer_data["water_content"],
+                                                            "notes": layer_data["notes"] or "",
+                                                        },
+                                                        change_reason=f"层位对齐校正: {correction_reason}",
+                                                        changed_by=corrected_by,
+                                                    )
+                                                    st.success("✅ 校正已提交并记录到版本历史")
+                                else:
+                                    st.info("暂无对齐组可校正")
+
+                            with annotation_tab:
+                                st.subheader("解释备注")
+
+                                annotation_type = st.selectbox(
+                                    "备注类型",
+                                    ["interpretation", "question", "suggestion", "boundary_definition"],
+                                    format_func=lambda x: {
+                                        "interpretation": "地质解释",
+                                        "question": "待确认问题",
+                                        "suggestion": "建议修改",
+                                        "boundary_definition": "界面定义",
+                                    }.get(x, x),
+                                    key="annotation_type"
+                                )
+
+                                target_type = st.selectbox(
+                                    "备注对象",
+                                    ["group", "surface", "zone", "general"],
+                                    format_func=lambda x: {
+                                        "group": "对齐组",
+                                        "surface": "关键界面",
+                                        "zone": "沉积分区",
+                                        "general": "总体说明",
+                                    }.get(x, x),
+                                    key="annotation_target_type"
+                                )
+
+                                target_id = None
+                                if target_type == "group" and a_result.get("aligned_groups"):
+                                    group_opts = [(f"组{g['group_id']}: {g['representative_name']}", g["group_id"])
+                                                  for g in a_result["aligned_groups"]]
+                                    sel_target_label = st.selectbox(
+                                        "选择对齐组",
+                                        [o[0] for o in group_opts],
+                                        key="annotation_group"
+                                    )
+                                    target_id = dict(group_opts)[sel_target_label]
+                                elif target_type == "surface" and s_result.get("key_surfaces"):
+                                    surface_opts = list(set(
+                                        s.get("surface_label", s["surface_type"])
+                                        for s in s_result["key_surfaces"]
+                                    ))
+                                    sel_surface = st.selectbox("选择界面类型", surface_opts, key="annotation_surface")
+                                    target_id = sel_surface
+
+                                annotation_content = st.text_area(
+                                    "备注内容",
+                                    placeholder="输入地质解释或备注信息...",
+                                    height=150,
+                                    key="annotation_content"
+                                )
+                                annotation_author = st.text_input("备注人", value="地质员", key="annotation_author")
+
+                                if st.button("📝 添加备注", key="submit_annotation"):
+                                    if not annotation_content.strip():
+                                        st.warning("请输入备注内容")
+                                    else:
+                                        db.add_alignment_annotation(
+                                            alignment_id=current_alignment_id,
+                                            annotation_type=annotation_type,
+                                            content=annotation_content,
+                                            target_type=target_type,
+                                            target_id=target_id,
+                                            author=annotation_author,
+                                        )
+                                        st.success("✅ 备注已保存")
+
+                                existing_annotations = db.get_alignment_annotations(current_alignment_id)
+                                if not existing_annotations.empty:
+                                    st.subheader("已有备注")
+                                    type_labels = {
+                                        "interpretation": "地质解释",
+                                        "question": "待确认问题",
+                                        "suggestion": "建议修改",
+                                        "boundary_definition": "界面定义",
+                                    }
+                                    target_labels = {
+                                        "group": "对齐组",
+                                        "surface": "关键界面",
+                                        "zone": "沉积分区",
+                                        "general": "总体说明",
+                                    }
+                                    ann_display = existing_annotations[["annotation_type", "target_type", "target_id", "content", "author", "created_at"]].copy()
+                                    ann_display["annotation_type"] = ann_display["annotation_type"].map(type_labels)
+                                    ann_display["target_type"] = ann_display["target_type"].map(target_labels)
+                                    ann_display.columns = ["备注类型", "对象类型", "对象ID", "内容", "备注人", "时间"]
+                                    st.dataframe(ann_display, use_container_width=True, hide_index=True)
+
+                            with history_tab:
+                                st.subheader("校正历史记录")
+                                corrections_df = db.get_alignment_corrections(current_alignment_id)
+                                if corrections_df.empty:
+                                    st.info("暂无校正记录")
+                                else:
+                                    corr_display = corrections_df[[
+                                        "group_id", "sample_code", "layer_id",
+                                        "original_depth_start", "original_depth_end",
+                                        "corrected_depth_start", "corrected_depth_end",
+                                        "correction_reason", "corrected_by", "created_at"
+                                    ]].copy()
+                                    corr_display.columns = [
+                                        "对齐组ID", "柱样编号", "层位ID",
+                                        "原始起点", "原始终点",
+                                        "校正起点", "校正终点",
+                                        "校正原因", "校正人", "时间"
+                                    ]
+                                    st.dataframe(corr_display, use_container_width=True, hide_index=True)
+
+                st.divider()
+                st.subheader("📥 成果图件与解释报告导出")
+
+                col_exp_type, col_exp_btn = st.columns([1, 1])
+                with col_exp_type:
+                    export_choice = st.selectbox(
+                        "选择导出内容",
+                        [
+                            "完整解释报告", "对齐结果数据", "层序延续性数据",
+                            "关键界面数据", "区域演化数据",
+                            "层序对比横断面图", "对齐质量评估图", "区域演化综合图",
+                        ],
+                        key="align_export_choice"
+                    )
+                with col_exp_btn:
+                    if st.button("📤 生成导出", key="align_export_btn"):
+                        if "alignment_result" not in st.session_state:
+                            st.warning("请先执行层位对齐分析")
+                        else:
+                            if export_choice == "完整解释报告":
+                                correction_records = []
+                                annotation_records = []
+                                current_alignment_id = st.session_state.get("current_alignment_id")
+                                if current_alignment_id:
+                                    correction_records = db.get_correction_dicts(current_alignment_id)
+                                    annotation_records = db.get_annotation_dicts(current_alignment_id)
+                                report = align.generate_alignment_report(
+                                    st.session_state.alignment_result,
+                                    st.session_state.get("continuity_result", {}),
+                                    st.session_state.get("surface_result", {}),
+                                    st.session_state.get("evolution_result", {}),
+                                    correction_records=correction_records,
+                                    annotation_records=annotation_records,
+                                )
+                                st.session_state.align_export_data = {
+                                    "data": report["report_text"],
+                                    "filename": f"层位对齐解释报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                                    "type": "txt",
+                                }
+                            elif export_choice == "对齐结果数据":
+                                groups = st.session_state.alignment_result.get("aligned_groups", [])
+                                rows = []
+                                for g in groups:
+                                    for m in g["members"]:
+                                        rows.append({
+                                            "对齐组ID": g["group_id"],
+                                            "代表名称": g["representative_name"],
+                                            "柱样编号": m["sample_code"],
+                                            "层位名称": m["layer_name"],
+                                            "深度(cm)": m["depth"],
+                                            "归一化深度": m["norm_depth"],
+                                            "相似度": g["avg_similarity"],
+                                        })
+                                csv_data = pd.DataFrame(rows).to_csv(index=False, encoding="utf-8-sig")
+                                st.session_state.align_export_data = {
+                                    "data": csv_data,
+                                    "filename": f"对齐结果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                    "type": "csv",
+                                }
+                            elif export_choice == "层序延续性数据":
+                                cont = st.session_state.get("continuity_result", {}).get("continuity", [])
+                                csv_data = pd.DataFrame(cont).to_csv(index=False, encoding="utf-8-sig")
+                                st.session_state.align_export_data = {
+                                    "data": csv_data,
+                                    "filename": f"层序延续性_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                    "type": "csv",
+                                }
+                            elif export_choice == "关键界面数据":
+                                surfaces = st.session_state.get("surface_result", {}).get("key_surfaces", [])
+                                csv_data = pd.DataFrame(surfaces).to_csv(index=False, encoding="utf-8-sig")
+                                st.session_state.align_export_data = {
+                                    "data": csv_data,
+                                    "filename": f"关键界面_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                    "type": "csv",
+                                }
+                            elif export_choice == "区域演化数据":
+                                zones = st.session_state.get("evolution_result", {}).get("zones", [])
+                                csv_data = pd.DataFrame(zones).to_csv(index=False, encoding="utf-8-sig")
+                                st.session_state.align_export_data = {
+                                    "data": csv_data,
+                                    "filename": f"区域演化_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                    "type": "csv",
+                                }
+                            elif export_choice == "层序对比横断面图":
+                                fig = visualizer.plot_cross_section_correlation(
+                                    st.session_state.alignment_result,
+                                    surface_result=st.session_state.get("surface_result", {}),
+                                    title="层序对比横断面图"
+                                )
+                                img_bytes = fig.to_image(format="png", width=1200, height=600, scale=2)
+                                st.session_state.align_export_data = {
+                                    "data": img_bytes,
+                                    "filename": f"层序对比横断面_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                                    "type": "png",
+                                }
+                            elif export_choice == "对齐质量评估图":
+                                quality = st.session_state.alignment_result.get("quality", {})
+                                if quality:
+                                    fig = visualizer.plot_alignment_quality(quality, title="对齐质量评估")
+                                    img_bytes = fig.to_image(format="png", width=1000, height=500, scale=2)
+                                    st.session_state.align_export_data = {
+                                        "data": img_bytes,
+                                        "filename": f"对齐质量评估_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                                        "type": "png",
+                                    }
+                                else:
+                                    st.warning("暂无质量评估数据，请先执行对齐分析")
+                            elif export_choice == "区域演化综合图":
+                                evo = st.session_state.get("evolution_result", {})
+                                if evo:
+                                    fig = visualizer.plot_regional_evolution_detailed(evo, title="区域沉积演化综合分析")
+                                    img_bytes = fig.to_image(format="png", width=1400, height=800, scale=2)
+                                    st.session_state.align_export_data = {
+                                        "data": img_bytes,
+                                        "filename": f"区域演化综合_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                                        "type": "png",
+                                    }
+                                else:
+                                    st.warning("暂无区域演化数据，请先执行对齐分析")
+                            st.success("✅ 导出数据已生成")
+
+                if "align_export_data" in st.session_state:
+                    export_type = st.session_state.align_export_data["type"]
+                    mime_map = {"txt": "text/plain", "csv": "text/csv", "png": "image/png"}
+                    st.download_button(
+                        label="⬇️ 下载导出文件",
+                        data=st.session_state.align_export_data["data"],
+                        file_name=st.session_state.align_export_data["filename"],
+                        mime=mime_map.get(export_type, "application/octet-stream"),
+                        use_container_width=True,
+                    )
+
+                st.divider()
+                st.subheader("📜 历史对齐会话")
+                history_df = db.get_alignment_results(10)
+                if history_df.empty:
+                    st.info("暂无历史对齐会话")
+                else:
+                    hist_display = history_df[["id", "session_name", "method", "threshold", "created_at"]].copy()
+                    method_labels = {"combined": "综合对齐", "lithology": "岩性对齐", "depth": "深度对齐", "dtw": "DTW对齐"}
+                    hist_display["method"] = hist_display["method"].map(method_labels)
+                    hist_display.columns = ["ID", "会话名称", "方法", "阈值", "创建时间"]
+                    st.dataframe(hist_display, use_container_width=True, hide_index=True)
 
 
 elif page == "🎯 质量控制工作台":
