@@ -380,3 +380,340 @@ def clear_import_errors() -> None:
     cursor.execute("DELETE FROM import_errors")
     conn.commit()
     conn.close()
+
+
+def add_layer_version(layer_id: int, core_id: int, layer_data: Dict[str, Any],
+                      change_reason: str = "", changed_by: str = "system") -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT MAX(version) as max_ver FROM layer_versions WHERE layer_id = ?", (layer_id,))
+    row = cursor.fetchone()
+    next_version = (row["max_ver"] or 0) + 1
+
+    cursor.execute("""
+        INSERT INTO layer_versions
+        (layer_id, core_id, version, layer_name, depth_start, depth_end,
+         gravel_pct, sand_pct, silt_pct, clay_pct, organic_matter, water_content,
+         notes, change_reason, changed_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        layer_id, core_id, next_version,
+        layer_data.get("layer_name"),
+        layer_data.get("depth_start"),
+        layer_data.get("depth_end"),
+        layer_data.get("gravel_pct"),
+        layer_data.get("sand_pct"),
+        layer_data.get("silt_pct"),
+        layer_data.get("clay_pct"),
+        layer_data.get("organic_matter"),
+        layer_data.get("water_content"),
+        layer_data.get("notes", ""),
+        change_reason,
+        changed_by
+    ))
+    version_id = cursor.lastrowid
+
+    cursor.execute("UPDATE core_samples SET version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (core_id,))
+
+    conn.commit()
+    conn.close()
+    return version_id
+
+
+def get_layer_versions(layer_id: int) -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql_query(
+        "SELECT * FROM layer_versions WHERE layer_id = ? ORDER BY version DESC",
+        conn, params=(layer_id,)
+    )
+    conn.close()
+    return df
+
+
+def get_core_versions(core_id: int) -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql_query("""
+        SELECT lv.*, l.layer_name as current_layer_name
+        FROM layer_versions lv
+        LEFT JOIN layers l ON lv.layer_id = l.id
+        WHERE lv.core_id = ?
+        ORDER BY lv.created_at DESC
+    """, conn, params=(core_id,))
+    conn.close()
+    return df
+
+
+def add_anomaly_review(layer_id: int, core_id: int, anomaly_type: str,
+                       anomaly_details: str = "") -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO anomaly_reviews (layer_id, core_id, anomaly_type, anomaly_details)
+        VALUES (?, ?, ?, ?)
+    """, (layer_id, core_id, anomaly_type, anomaly_details))
+    review_id = cursor.lastrowid
+
+    cursor.execute("UPDATE layers SET is_anomaly = 1, anomaly_status = 'pending' WHERE id = ?", (layer_id,))
+
+    conn.commit()
+    conn.close()
+    return review_id
+
+
+def update_anomaly_review(review_id: int, status: str, review_notes: str = "",
+                          reviewer: str = "") -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE anomaly_reviews
+        SET status = ?, review_notes = ?, reviewer = ?, reviewed_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (status, review_notes, reviewer, review_id))
+
+    cursor.execute("SELECT layer_id FROM anomaly_reviews WHERE id = ?", (review_id,))
+    row = cursor.fetchone()
+    if row:
+        cursor.execute("UPDATE layers SET anomaly_status = ? WHERE id = ?", (status, row["layer_id"]))
+
+    conn.commit()
+    conn.close()
+
+
+def get_anomaly_reviews(core_id: int = None, status: str = None) -> pd.DataFrame:
+    conn = get_connection()
+    query = "SELECT ar.*, l.layer_name, l.depth_start, l.depth_end, cs.sample_code, s.station_code " \
+            "FROM anomaly_reviews ar " \
+            "JOIN layers l ON ar.layer_id = l.id " \
+            "JOIN core_samples cs ON ar.core_id = cs.id " \
+            "JOIN stations s ON cs.station_id = s.id WHERE 1=1"
+    params = []
+
+    if core_id is not None:
+        query += " AND ar.core_id = ?"
+        params.append(core_id)
+
+    if status is not None:
+        query += " AND ar.status = ?"
+        params.append(status)
+
+    query += " ORDER BY ar.created_at DESC"
+    df = pd.read_sql_query(query, conn, params=params if params else None)
+    conn.close()
+    return df
+
+
+def create_import_session(file_name: str, total_rows: int = 0,
+                          import_mode: str = "append", file_hash: str = "",
+                          session_note: str = "") -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO import_sessions (file_name, file_hash, total_rows, import_mode, session_note)
+        VALUES (?, ?, ?, ?, ?)
+    """, (file_name, file_hash, total_rows, import_mode, session_note))
+    session_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return session_id
+
+
+def update_import_session(session_id: int, **kwargs) -> None:
+    if not kwargs:
+        return
+    conn = get_connection()
+    cursor = conn.cursor()
+    set_clause = ", ".join([f"{k} = ?" for k in kwargs.keys()])
+    params = list(kwargs.values()) + [session_id]
+    cursor.execute(f"UPDATE import_sessions SET {set_clause} WHERE id = ?", params)
+    conn.commit()
+    conn.close()
+
+
+def get_import_sessions(limit: int = 20) -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql_query(
+        "SELECT * FROM import_sessions ORDER BY created_at DESC LIMIT ?",
+        conn, params=(limit,)
+    )
+    conn.close()
+    return df
+
+
+def log_import_error_v2(session_id: int, file_name: str, row_number: int,
+                        row_data: str, error_reason: str, error_type: str = "validation") -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO import_errors (session_id, file_name, row_number, row_data, error_type, error_reason)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (session_id, file_name, row_number, row_data, error_type, error_reason))
+    conn.commit()
+    conn.close()
+
+
+def mark_layer_duplicate(layer_id: int, duplicate_of: int) -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE layers SET is_duplicate = 1, duplicate_of = ? WHERE id = ?",
+                   (duplicate_of, layer_id))
+    conn.commit()
+    conn.close()
+
+
+def mark_layer_overlap(layer_id: int, overlap_with: str) -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE layers SET is_overlap = 1, overlap_with = ? WHERE id = ?",
+                   (overlap_with, layer_id))
+    conn.commit()
+    conn.close()
+
+
+def clear_layer_flags(core_id: int) -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE layers SET is_duplicate = 0, duplicate_of = NULL, is_overlap = 0, overlap_with = NULL
+        WHERE core_id = ?
+    """, (core_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_duplicate_layers(core_id: int) -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql_query("""
+        SELECT * FROM layers WHERE core_id = ? AND is_duplicate = 1 ORDER BY depth_start
+    """, conn, params=(core_id,))
+    conn.close()
+    return df
+
+
+def get_overlap_layers(core_id: int) -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql_query("""
+        SELECT * FROM layers WHERE core_id = ? AND is_overlap = 1 ORDER BY depth_start
+    """, conn, params=(core_id,))
+    conn.close()
+    return df
+
+
+def get_station_cores_summary(station_code: str = None) -> pd.DataFrame:
+    conn = get_connection()
+    query = """
+        SELECT s.station_code, s.station_name, s.location,
+               COUNT(cs.id) as core_count,
+               COUNT(l.id) as layer_count,
+               SUM(l.depth_end - l.depth_start) as total_thickness
+        FROM stations s
+        LEFT JOIN core_samples cs ON s.id = cs.station_id
+        LEFT JOIN layers l ON cs.id = l.core_id
+    """
+    params = []
+    if station_code:
+        query += " WHERE s.station_code = ?"
+        params.append(station_code)
+    query += " GROUP BY s.id ORDER BY s.station_code"
+
+    df = pd.read_sql_query(query, conn, params=params if params else None)
+    conn.close()
+    return df
+
+
+def get_cores_by_station(station_code: str) -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql_query("""
+        SELECT cs.*, s.station_code, s.station_name
+        FROM core_samples cs
+        JOIN stations s ON cs.station_id = s.id
+        WHERE s.station_code = ?
+        ORDER BY cs.sample_code
+    """, conn, params=(station_code,))
+    conn.close()
+    return df
+
+
+def add_export_record(export_type: str, scope: str, filters: Dict, record_count: int,
+                      file_name: str, export_format: str = "csv") -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO export_records (export_type, scope, filters, record_count, file_name, export_format)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (export_type, scope, json.dumps(filters), record_count, file_name, export_format))
+    export_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return export_id
+
+
+def get_export_records(limit: int = 10) -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql_query(
+        "SELECT * FROM export_records ORDER BY created_at DESC LIMIT ?",
+        conn, params=(limit,)
+    )
+    conn.close()
+    return df
+
+
+def update_layer_with_version(layer_id: int, layer_data: Dict[str, Any],
+                              change_reason: str = "", changed_by: str = "user") -> None:
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM layers WHERE id = ?", (layer_id,))
+    old_row = cursor.fetchone()
+    if old_row:
+        old_data = dict(old_row)
+        cursor.execute("SELECT MAX(version) as max_ver FROM layer_versions WHERE layer_id = ?", (layer_id,))
+        ver_row = cursor.fetchone()
+        next_version = (ver_row["max_ver"] or 0) + 1
+
+        cursor.execute("""
+            INSERT INTO layer_versions
+            (layer_id, core_id, version, layer_name, depth_start, depth_end,
+             gravel_pct, sand_pct, silt_pct, clay_pct, organic_matter, water_content,
+             notes, change_reason, changed_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            layer_id, old_data["core_id"], next_version,
+            old_data["layer_name"], old_data["depth_start"], old_data["depth_end"],
+            old_data["gravel_pct"], old_data["sand_pct"], old_data["silt_pct"],
+            old_data["clay_pct"], old_data["organic_matter"], old_data["water_content"],
+            old_data["notes"], change_reason, changed_by
+        ))
+
+        cursor.execute("""
+            UPDATE layers SET
+                layer_name = ?, depth_start = ?, depth_end = ?,
+                gravel_pct = ?, sand_pct = ?, silt_pct = ?, clay_pct = ?,
+                organic_matter = ?, water_content = ?, notes = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (
+            layer_data["layer_name"], layer_data["depth_start"], layer_data["depth_end"],
+            layer_data.get("gravel_pct", 0), layer_data.get("sand_pct", 0),
+            layer_data.get("silt_pct", 0), layer_data.get("clay_pct", 0),
+            layer_data.get("organic_matter"), layer_data.get("water_content"),
+            layer_data.get("notes", ""), layer_id
+        ))
+
+        cursor.execute("""
+            UPDATE core_samples SET version = version + 1, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (old_data["core_id"],))
+
+    conn.commit()
+    conn.close()
+
+
+def get_layer_by_id(layer_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM layers WHERE id = ?", (layer_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None

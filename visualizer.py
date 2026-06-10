@@ -462,3 +462,244 @@ def plot_layer_thickness_bar(summary_df: pd.DataFrame, title: str = "各层位�
     )
 
     return fig
+
+
+def plot_cross_correlation_heatmap(corr_dict: Dict[str, pd.DataFrame],
+                                   title: str = "多柱样交叉相关性") -> go.Figure:
+    if not corr_dict:
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    indicators = list(corr_dict.keys())
+    n_indicators = len(indicators)
+
+    fig = make_subplots(
+        rows=1, cols=n_indicators,
+        subplot_titles=indicators,
+        horizontal_spacing=0.08,
+    )
+
+    for i, ind in enumerate(indicators, 1):
+        corr_matrix = corr_dict[ind]
+        if corr_matrix.empty:
+            continue
+
+        fig.add_trace(
+            go.Heatmap(
+                z=corr_matrix.values,
+                x=corr_matrix.columns,
+                y=corr_matrix.index,
+                zmin=-1,
+                zmax=1,
+                colorscale="RdBu_r",
+                text=corr_matrix.values.round(2),
+                texttemplate="%{text}",
+                textfont={"size": 10},
+                hovertemplate="%{x} vs %{y}<br>相关系数: %{z:.3f}<extra></extra>",
+                showscale=(i == n_indicators),
+            ),
+            row=1, col=i
+        )
+
+    fig.update_layout(
+        title=title,
+        height=400,
+        width=300 * n_indicators + 100,
+    )
+
+    return fig
+
+
+def plot_quality_markers(core_section_fig: go.Figure, layers_df: pd.DataFrame,
+                         duplicates: List[Dict], overlaps: List[Dict]) -> go.Figure:
+    if layers_df.empty:
+        return core_section_fig
+
+    for dup in duplicates:
+        layer = layers_df[layers_df["id"] == dup["layer_id_2"]]
+        if not layer.empty:
+            depth_mid = -(float(layer["depth_start"].iloc[0]) + float(layer["depth_end"].iloc[0])) / 2
+            core_section_fig.add_annotation(
+                x=1,
+                y=depth_mid,
+                text="⚠️ 重复",
+                showarrow=True,
+                arrowhead=2,
+                ax=50,
+                ay=0,
+                font=dict(color="orange", size=10),
+                bgcolor="rgba(255,255,255,0.8)",
+            )
+
+    for overlap in overlaps:
+        layer = layers_df[layers_df["id"] == overlap["layer_id_2"]]
+        if not layer.empty:
+            depth_mid = -(float(layer["depth_start"].iloc[0]) + float(layer["depth_end"].iloc[0])) / 2
+            core_section_fig.add_annotation(
+                x=1,
+                y=depth_mid,
+                text="🔴 重叠",
+                showarrow=True,
+                arrowhead=2,
+                ax=50,
+                ay=0,
+                font=dict(color="red", size=10),
+                bgcolor="rgba(255,255,255,0.8)",
+            )
+
+    return core_section_fig
+
+
+def plot_station_comparison_radar(core_stats_list: List[Dict[str, Any]],
+                                  title: str = "站位内多柱样指标对比雷达图") -> go.Figure:
+    if not core_stats_list:
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    indicators = ["avg_sand", "avg_silt", "avg_clay", "avg_organic", "recovery_rate"]
+    indicator_names = {
+        "avg_sand": "平均砂含量 (%)",
+        "avg_silt": "平均粉砂含量 (%)",
+        "avg_clay": "平均黏土含量 (%)",
+        "avg_organic": "平均有机质 (%)",
+        "recovery_rate": "取芯率 (%)",
+    }
+
+    fig = go.Figure()
+
+    colors = px.colors.qualitative.Plotly
+
+    for idx, stats in enumerate(core_stats_list):
+        values = []
+        for ind in indicators:
+            val = stats.get(ind, 0)
+            if pd.isna(val):
+                val = 0
+            values.append(float(val))
+
+        fig.add_trace(go.Scatterpolar(
+            r=values,
+            theta=[indicator_names[ind] for ind in indicators],
+            fill='toself',
+            name=stats.get("sample_code", f"柱样{idx+1}"),
+            line=dict(color=colors[idx % len(colors)]),
+        ))
+
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(
+                visible=True,
+                range=[0, 100]
+            )),
+        showlegend=True,
+        title=title,
+        height=500,
+    )
+
+    return fig
+
+
+def plot_anomaly_status_pie(anomalies_df: pd.DataFrame,
+                            title: str = "异常复核状态分布") -> go.Figure:
+    if anomalies_df.empty:
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    status_counts = anomalies_df["status"].value_counts()
+
+    colors = {
+        "pending": "#ffc107",
+        "reviewed": "#28a745",
+        "confirmed": "#dc3545",
+        "dismissed": "#6c757d",
+    }
+
+    fig = go.Figure(data=[go.Pie(
+        labels=status_counts.index,
+        values=status_counts.values,
+        hole=0.4,
+        marker=dict(
+            colors=[colors.get(s, "#999") for s in status_counts.index]
+        ),
+        textinfo="label+percent",
+        hovertemplate="%{label}: %{value} 个 (%{percent})<extra></extra>",
+    )])
+
+    fig.update_layout(
+        title=title,
+        height=400,
+    )
+
+    return fig
+
+
+def plot_version_timeline(versions_df: pd.DataFrame,
+                          title: str = "层位版本历史") -> go.Figure:
+    if versions_df.empty:
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=versions_df["created_at"],
+        y=versions_df["version"],
+        mode="lines+markers",
+        name="版本号",
+        marker=dict(size=10, color="#2d5f8f"),
+        line=dict(width=2),
+        hovertext=[
+            f"版本: v{row['version']}<br>"
+            f"深度: {row['depth_start']}-{row['depth_end']} cm<br>"
+            f"修改原因: {row.get('change_reason', 'N/A')}<br>"
+            f"修改人: {row.get('changed_by', 'system')}<br>"
+            f"时间: {row['created_at']}"
+            for _, row in versions_df.iterrows()
+        ],
+        hoverinfo="text",
+    ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="时间",
+        yaxis_title="版本号",
+        height=400,
+    )
+
+    return fig
+
+
+def plot_missing_severity_gauge(missing_pct: float, title: str = "数据完整度评估") -> go.Figure:
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=100 - missing_pct,
+        domain={'x': [0, 1], 'y': [0, 1]},
+        title={'text': title},
+        gauge={
+            'axis': {'range': [0, 100], 'tickwidth': 1, 'tickcolor': "darkblue"},
+            'bar': {'color': "darkblue"},
+            'bgcolor': "white",
+            'borderwidth': 2,
+            'bordercolor': "gray",
+            'steps': [
+                {'range': [0, 70], 'color': '#dc3545'},
+                {'range': [70, 90], 'color': '#ffc107'},
+                {'range': [90, 100], 'color': '#28a745'},
+            ],
+            'threshold': {
+                'line': {'color': "red", 'width': 4},
+                'thickness': 0.75,
+                'value': 100 - missing_pct
+            }
+        }
+    ))
+
+    fig.update_layout(
+        height=300,
+    )
+
+    return fig
