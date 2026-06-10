@@ -705,19 +705,22 @@ elif page == "📈 多柱样对比":
                 st.info("暂无站位数据")
         else:
             selected_cores = st.multiselect(
-                "选择要对比的柱样（至少2个）",
+                "选择要对比的柱样（至少2个，仅限同一站位）",
                 cores_df["sample_code"].tolist(),
-                help="建议选择同一站位的柱样进行对比，不同站位的数据不建议直接合并统计"
+                help="必须选择同一站位的柱样进行对比，不同站位的数据禁止混合统计"
             )
             if len(selected_cores) < 2:
                 st.warning("请至少选择2个柱样进行对比")
             else:
                 stations_in_selection = cores_df[cores_df["sample_code"].isin(selected_cores)]["station_code"].unique()
                 if len(stations_in_selection) > 1:
-                    st.warning(
-                        f"⚠️ 您选择了 {len(stations_in_selection)} 个不同站位的柱样，"
-                        f"不同站位数据不直接合并统计，仅作对比展示。"
+                    st.error(
+                        f"❌ 禁止跨站位混合统计！您选择了 {len(stations_in_selection)} 个不同站位的柱样："
+                        f"{', '.join(stations_in_selection)}。\n\n"
+                        f"根据海洋地质数据规范，不同站位的沉积环境、采样条件可能存在显著差异，"
+                        f"数据不可直接混合统计。请选择同一站位的柱样进行对比。"
                     )
+                    selected_cores = []
                 else:
                     selected_station_name = stations_in_selection[0]
                     st.success(f"✅ 已选择 {len(selected_cores)} 个柱样（同属站位 {stations_in_selection[0]}）")
@@ -753,13 +756,26 @@ elif page == "📈 多柱样对比":
                     combined_layers = comparison["combined_layers"]
                     combined_csv = combined_layers.to_csv(index=False, encoding="utf-8-sig")
 
+                    export_filename = f"多柱样对比_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                     st.session_state.export_data = {
                         "report_csv": csv_str,
                         "layers_csv": combined_csv,
-                        "filename": f"多柱样对比_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                        "filename": export_filename
                     }
 
-                    st.success("✅ 报告已生成，可在下方下载")
+                    db.add_export_record(
+                        export_type="comparison_report",
+                        scope="station" if selected_station_name else "selected",
+                        filters={
+                            "station": selected_station_name,
+                            "cores": selected_cores
+                        },
+                        record_count=len(combined_layers),
+                        file_name=f"{export_filename}.zip",
+                        export_format="csv"
+                    )
+
+                    st.success("✅ 报告已生成，可在下方下载，导出记录已保存")
 
             if "export_data" in st.session_state:
                 col_dl1, col_dl2 = st.columns(2)
@@ -780,7 +796,7 @@ elif page == "📈 多柱样对比":
 
             tab1, tab2, tab3, tab4, tab5 = st.tabs([
                 "📊 并排分层对比", "📈 指标对比",
-                "� 层间相关性", "� 统计数据对比", "🗂️ 综合报告"
+                "🔗 层间相关性", "📋 统计数据对比", "🗂️ 综合报告"
             ])
 
             with tab1:
@@ -1513,5 +1529,16 @@ elif page == "⚙️ 数据管理与版本":
         exp_display = export_history[[
             "export_type", "scope", "record_count", "file_name", "created_at"
         ]].copy()
+
+        type_mapping = {
+            "layers": "层位数据",
+            "quality_report": "质量报告",
+            "comparison_report": "对比报告",
+        }
+
+        exp_display["export_type"] = exp_display["export_type"].map(
+            lambda x: type_mapping.get(x, x)
+        )
+
         exp_display.columns = ["导出类型", "范围", "记录数", "文件名", "时间"]
         st.dataframe(exp_display, use_container_width=True, hide_index=True)
