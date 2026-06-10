@@ -1174,6 +1174,36 @@ elif page == "🔗 层位对齐与区域演化":
                         st.session_state.current_alignment_id = alignment_id
                         st.success(f"✅ 层位对齐分析完成！对齐会话ID: {alignment_id}")
 
+                # 检测参数或柱样选择是否变化，如果变化则清除旧结果
+                should_clear_results = False
+                if "alignment_core_ids" in st.session_state:
+                    if set(st.session_state.alignment_core_ids) != set(selected_core_ids):
+                        should_clear_results = True
+
+                # 检测参数变化
+                last_params = st.session_state.get("last_alignment_params")
+                current_params = {
+                    "method": align_method,
+                    "threshold": sim_threshold,
+                    "depth_tolerance": depth_tolerance,
+                    "weights": indicator_weight_config,
+                    "strat_order": enforce_strat_order,
+                }
+                if last_params and last_params != current_params:
+                    should_clear_results = True
+                st.session_state.last_alignment_params = current_params
+
+                if "align_export_data" in st.session_state:
+                    del st.session_state.align_export_data
+
+                if should_clear_results:
+                    for key in ["alignment_result", "continuity_result", "surface_result",
+                                "evolution_result", "alignment_core_ids", "current_alignment_id",
+                                "similar_result"]:
+                        if key in st.session_state:
+                            del st.session_state[key]
+                    st.warning("⚠️ 检测到柱样选择或参数已变化，旧对齐结果已清除，请重新执行分析")
+
                 if "alignment_result" in st.session_state:
                     a_result = st.session_state.alignment_result
                     c_result = st.session_state.get("continuity_result", {})
@@ -1532,36 +1562,61 @@ elif page == "🔗 层位对齐与区域演化":
                                                 elif new_depth_start >= new_depth_end:
                                                     st.error("深度起点必须小于终点")
                                                 else:
-                                                    db.add_alignment_correction(
-                                                        alignment_id=current_alignment_id,
-                                                        group_id=sel_group_id,
-                                                        sample_code=sel_member["sample_code"],
-                                                        layer_id=sel_member["layer_id"],
-                                                        original_depth_start=float(layer_data["depth_start"]),
-                                                        original_depth_end=float(layer_data["depth_end"]),
-                                                        corrected_depth_start=new_depth_start,
-                                                        corrected_depth_end=new_depth_end,
-                                                        correction_reason=correction_reason,
-                                                        corrected_by=corrected_by,
-                                                    )
-                                                    db.update_layer_with_version(
-                                                        sel_member["layer_id"],
-                                                        {
-                                                            "layer_name": layer_data["layer_name"],
-                                                            "depth_start": new_depth_start,
-                                                            "depth_end": new_depth_end,
-                                                            "gravel_pct": layer_data["gravel_pct"] or 0,
-                                                            "sand_pct": layer_data["sand_pct"] or 0,
-                                                            "silt_pct": layer_data["silt_pct"] or 0,
-                                                            "clay_pct": layer_data["clay_pct"] or 0,
-                                                            "organic_matter": layer_data["organic_matter"],
-                                                            "water_content": layer_data["water_content"],
-                                                            "notes": layer_data["notes"] or "",
-                                                        },
-                                                        change_reason=f"层位对齐校正: {correction_reason}",
-                                                        changed_by=corrected_by,
-                                                    )
-                                                    st.success("✅ 校正已提交并记录到版本历史")
+                                                    core_id = layer_data["core_id"]
+                                                    all_layers = db.get_core_layers(core_id)
+                                                    overlap_found = False
+                                                    overlap_details = []
+                                                    for _, other_layer in all_layers.iterrows():
+                                                        if other_layer["id"] == sel_member["layer_id"]:
+                                                            continue
+                                                        other_start = float(other_layer["depth_start"])
+                                                        other_end = float(other_layer["depth_end"])
+                                                        if (new_depth_start < other_end and new_depth_end > other_start):
+                                                            overlap_found = True
+                                                            overlap_details.append(
+                                                                f"层位 '{other_layer['layer_name']}' "
+                                                                f"({other_start:.1f}-{other_end:.1f}cm)"
+                                                            )
+
+                                                    if overlap_found:
+                                                        st.error(
+                                                            "❌ 深度重叠校验失败！\n\n"
+                                                            f"校正后深度 {new_depth_start:.1f}-{new_depth_end:.1f}cm "
+                                                            f"与以下层位重叠：\n" +
+                                                            "\n".join(f"  • {d}" for d in overlap_details) +
+                                                            "\n\n请调整深度范围后再提交。"
+                                                        )
+                                                    else:
+                                                        db.add_alignment_correction(
+                                                            alignment_id=current_alignment_id,
+                                                            group_id=sel_group_id,
+                                                            sample_code=sel_member["sample_code"],
+                                                            layer_id=sel_member["layer_id"],
+                                                            original_depth_start=float(layer_data["depth_start"]),
+                                                            original_depth_end=float(layer_data["depth_end"]),
+                                                            corrected_depth_start=new_depth_start,
+                                                            corrected_depth_end=new_depth_end,
+                                                            correction_reason=correction_reason,
+                                                            corrected_by=corrected_by,
+                                                        )
+                                                        db.update_layer_with_version(
+                                                            sel_member["layer_id"],
+                                                            {
+                                                                "layer_name": layer_data["layer_name"],
+                                                                "depth_start": new_depth_start,
+                                                                "depth_end": new_depth_end,
+                                                                "gravel_pct": layer_data["gravel_pct"] or 0,
+                                                                "sand_pct": layer_data["sand_pct"] or 0,
+                                                                "silt_pct": layer_data["silt_pct"] or 0,
+                                                                "clay_pct": layer_data["clay_pct"] or 0,
+                                                                "organic_matter": layer_data["organic_matter"],
+                                                                "water_content": layer_data["water_content"],
+                                                                "notes": layer_data["notes"] or "",
+                                                            },
+                                                            change_reason=f"层位对齐校正: {correction_reason}",
+                                                            changed_by=corrected_by,
+                                                        )
+                                                        st.success("✅ 校正已提交并记录到版本历史")
                                 else:
                                     st.info("暂无对齐组可校正")
 
@@ -1692,6 +1747,12 @@ elif page == "🔗 层位对齐与区域演化":
                         if "alignment_result" not in st.session_state:
                             st.warning("请先执行层位对齐分析")
                         else:
+                            export_filters = {
+                                "core_ids": selected_core_ids,
+                                "method": align_method,
+                                "threshold": sim_threshold,
+                                "alignment_id": st.session_state.get("current_alignment_id"),
+                            }
                             if export_choice == "完整解释报告":
                                 correction_records = []
                                 annotation_records = []
@@ -1707,11 +1768,21 @@ elif page == "🔗 层位对齐与区域演化":
                                     correction_records=correction_records,
                                     annotation_records=annotation_records,
                                 )
+                                export_filename = f"层位对齐解释报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
                                 st.session_state.align_export_data = {
                                     "data": report["report_text"],
-                                    "filename": f"层位对齐解释报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                                    "filename": export_filename,
                                     "type": "txt",
                                 }
+                                report_length = len(report["report_text"].splitlines())
+                                db.add_export_record(
+                                    export_type="alignment_report",
+                                    scope="alignment",
+                                    filters=export_filters,
+                                    record_count=report_length,
+                                    file_name=export_filename,
+                                    export_format="txt"
+                                )
                             elif export_choice == "对齐结果数据":
                                 groups = st.session_state.alignment_result.get("aligned_groups", [])
                                 rows = []
@@ -1727,35 +1798,71 @@ elif page == "🔗 层位对齐与区域演化":
                                             "相似度": g["avg_similarity"],
                                         })
                                 csv_data = pd.DataFrame(rows).to_csv(index=False, encoding="utf-8-sig")
+                                export_filename = f"对齐结果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
                                 st.session_state.align_export_data = {
                                     "data": csv_data,
-                                    "filename": f"对齐结果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                    "filename": export_filename,
                                     "type": "csv",
                                 }
+                                db.add_export_record(
+                                    export_type="alignment_data",
+                                    scope="alignment",
+                                    filters=export_filters,
+                                    record_count=len(rows),
+                                    file_name=export_filename,
+                                    export_format="csv"
+                                )
                             elif export_choice == "层序延续性数据":
                                 cont = st.session_state.get("continuity_result", {}).get("continuity", [])
                                 csv_data = pd.DataFrame(cont).to_csv(index=False, encoding="utf-8-sig")
+                                export_filename = f"层序延续性_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
                                 st.session_state.align_export_data = {
                                     "data": csv_data,
-                                    "filename": f"层序延续性_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                    "filename": export_filename,
                                     "type": "csv",
                                 }
+                                db.add_export_record(
+                                    export_type="continuity_data",
+                                    scope="alignment",
+                                    filters=export_filters,
+                                    record_count=len(cont),
+                                    file_name=export_filename,
+                                    export_format="csv"
+                                )
                             elif export_choice == "关键界面数据":
                                 surfaces = st.session_state.get("surface_result", {}).get("key_surfaces", [])
                                 csv_data = pd.DataFrame(surfaces).to_csv(index=False, encoding="utf-8-sig")
+                                export_filename = f"关键界面_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
                                 st.session_state.align_export_data = {
                                     "data": csv_data,
-                                    "filename": f"关键界面_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                    "filename": export_filename,
                                     "type": "csv",
                                 }
+                                db.add_export_record(
+                                    export_type="surface_data",
+                                    scope="alignment",
+                                    filters=export_filters,
+                                    record_count=len(surfaces),
+                                    file_name=export_filename,
+                                    export_format="csv"
+                                )
                             elif export_choice == "区域演化数据":
                                 zones = st.session_state.get("evolution_result", {}).get("zones", [])
                                 csv_data = pd.DataFrame(zones).to_csv(index=False, encoding="utf-8-sig")
+                                export_filename = f"区域演化_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
                                 st.session_state.align_export_data = {
                                     "data": csv_data,
-                                    "filename": f"区域演化_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                                    "filename": export_filename,
                                     "type": "csv",
                                 }
+                                db.add_export_record(
+                                    export_type="evolution_data",
+                                    scope="alignment",
+                                    filters=export_filters,
+                                    record_count=len(zones),
+                                    file_name=export_filename,
+                                    export_format="csv"
+                                )
                             elif export_choice == "层序对比横断面图":
                                 fig = visualizer.plot_cross_section_correlation(
                                     st.session_state.alignment_result,
@@ -1763,21 +1870,39 @@ elif page == "🔗 层位对齐与区域演化":
                                     title="层序对比横断面图"
                                 )
                                 img_bytes = fig.to_image(format="png", width=1200, height=600, scale=2)
+                                export_filename = f"层序对比横断面_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
                                 st.session_state.align_export_data = {
                                     "data": img_bytes,
-                                    "filename": f"层序对比横断面_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                                    "filename": export_filename,
                                     "type": "png",
                                 }
+                                db.add_export_record(
+                                    export_type="alignment_figure",
+                                    scope="alignment",
+                                    filters=export_filters,
+                                    record_count=1,
+                                    file_name=export_filename,
+                                    export_format="png"
+                                )
                             elif export_choice == "对齐质量评估图":
                                 quality = st.session_state.alignment_result.get("quality", {})
                                 if quality:
                                     fig = visualizer.plot_alignment_quality(quality, title="对齐质量评估")
                                     img_bytes = fig.to_image(format="png", width=1000, height=500, scale=2)
+                                    export_filename = f"对齐质量评估_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
                                     st.session_state.align_export_data = {
                                         "data": img_bytes,
-                                        "filename": f"对齐质量评估_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                                        "filename": export_filename,
                                         "type": "png",
                                     }
+                                    db.add_export_record(
+                                        export_type="alignment_figure",
+                                        scope="alignment",
+                                        filters=export_filters,
+                                        record_count=1,
+                                        file_name=export_filename,
+                                        export_format="png"
+                                    )
                                 else:
                                     st.warning("暂无质量评估数据，请先执行对齐分析")
                             elif export_choice == "区域演化综合图":
@@ -1785,11 +1910,20 @@ elif page == "🔗 层位对齐与区域演化":
                                 if evo:
                                     fig = visualizer.plot_regional_evolution_detailed(evo, title="区域沉积演化综合分析")
                                     img_bytes = fig.to_image(format="png", width=1400, height=800, scale=2)
+                                    export_filename = f"区域演化综合_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
                                     st.session_state.align_export_data = {
                                         "data": img_bytes,
-                                        "filename": f"区域演化综合_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                                        "filename": export_filename,
                                         "type": "png",
                                     }
+                                    db.add_export_record(
+                                        export_type="alignment_figure",
+                                        scope="alignment",
+                                        filters=export_filters,
+                                        record_count=1,
+                                        file_name=export_filename,
+                                        export_format="png"
+                                    )
                                 else:
                                     st.warning("暂无区域演化数据，请先执行对齐分析")
                             st.success("✅ 导出数据已生成")
