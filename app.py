@@ -134,13 +134,19 @@ elif page == "📥 数据导入":
 
     st.subheader("上传CSV文件")
     uploaded_file = st.file_uploader("选择CSV文件", type=["csv"])
+    overwrite_mode = st.checkbox("覆盖已存在的同名柱样数据", value=True,
+                                  help="如果勾选，重复导入同名柱样时将先清除旧数据再导入新数据")
 
     if uploaded_file is not None:
         try:
-            success_count, errors = validator.import_csv(uploaded_file, uploaded_file.name)
+            success_count, skipped_count, errors = validator.import_csv(
+                uploaded_file, uploaded_file.name, overwrite_existing=overwrite_mode
+            )
 
             if success_count > 0:
                 st.success(f"✅ 成功导入 {success_count} 条层位记录")
+            if skipped_count > 0 and not overwrite_mode:
+                st.info(f"ℹ️ 跳过 {skipped_count} 条已存在的柱样记录")
 
             if errors:
                 st.warning(f"⚠️ 有 {len(errors)} 条记录导入失败")
@@ -487,11 +493,21 @@ elif page == "⚙️ 数据管理":
                 notes = st.text_area("备注", value=layer_data["notes"] or "")
 
                 if st.button("保存修改", key="save_layer_edit"):
-                    total_pct = gravel_pct + sand_pct + silt_pct + clay_pct
-                    if depth_start >= depth_end:
-                        st.error("❌ 深度起点必须小于终点")
-                    elif total_pct > 100.1:
-                        st.error(f"❌ 颗粒百分比总和({total_pct:.1f}%)超过100%")
+                    depth_ok, depth_err = validator.validate_layer_edit(
+                        edit_core_id, layer_id, depth_start, depth_end
+                    )
+                    pct_ok, pct_err = validator.validate_percentages(
+                        gravel_pct, sand_pct, silt_pct, clay_pct
+                    )
+
+                    if not depth_ok:
+                        st.error(f"❌ {depth_err}")
+                    elif not pct_ok:
+                        st.error(f"❌ {pct_err}")
+                    elif organic_matter < 0:
+                        st.error("❌ 有机质含量不能为负数")
+                    elif water_content < 0:
+                        st.error("❌ 含水率不能为负数")
                     else:
                         updated_data = {
                             "layer_name": layer_name,

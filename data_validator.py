@@ -104,7 +104,7 @@ def _validate_row(row: pd.Series, row_num: int, existing_depths: List[Tuple[floa
     return True, ""
 
 
-def import_csv(file, file_name: str) -> Tuple[int, List[Dict[str, Any]]]:
+def import_csv(file, file_name: str, overwrite_existing: bool = True) -> Tuple[int, int, List[Dict[str, Any]]]:
     df = pd.read_csv(file)
 
     df, missing_cols = _map_columns(df)
@@ -112,8 +112,22 @@ def import_csv(file, file_name: str) -> Tuple[int, List[Dict[str, Any]]]:
         raise ValueError(f"缺少必需的列: {', '.join(missing_cols)}")
 
     success_count = 0
+    skipped_count = 0
     errors = []
     core_depths: Dict[str, List[Tuple[float, float]]] = {}
+    cleared_cores: set = set()
+
+    all_cores = db.get_all_core_samples()
+    sample_code_to_id = dict(zip(all_cores["sample_code"], all_cores["id"])) if not all_cores.empty else {}
+
+    for sample_code, core_id in sample_code_to_id.items():
+        existing_layers = db.get_core_layers(core_id)
+        if not existing_layers.empty:
+            core_depths[sample_code] = list(
+                zip(existing_layers["depth_start"], existing_layers["depth_end"])
+            )
+        else:
+            core_depths[sample_code] = []
 
     station_code_col = "station_code" if "station_code" in df.columns else None
 
@@ -123,6 +137,20 @@ def import_csv(file, file_name: str) -> Tuple[int, List[Dict[str, Any]]]:
 
         if sample_code not in core_depths:
             core_depths[sample_code] = []
+
+        if sample_code in sample_code_to_id and sample_code not in cleared_cores:
+            if overwrite_existing:
+                existing_core_id = sample_code_to_id[sample_code]
+                conn = db.get_connection()
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM layers WHERE core_id = ?", (existing_core_id,))
+                conn.commit()
+                conn.close()
+                core_depths[sample_code] = []
+                cleared_cores.add(sample_code)
+            else:
+                skipped_count += 1
+                continue
 
         is_valid, error_msg = _validate_row(row, row_num, core_depths[sample_code])
 
@@ -140,13 +168,11 @@ def import_csv(file, file_name: str) -> Tuple[int, List[Dict[str, Any]]]:
             station_code = str(row[station_code_col]).strip() if station_code_col and not pd.isna(row[station_code_col]) else "默认站位"
             station_id = db.add_station(station_code, station_code)
 
-            core_df = db.get_all_core_samples()
-            core_exists = core_df[core_df["sample_code"] == sample_code]
-
-            if core_exists.empty:
-                core_id = db.add_core_sample(station_id, sample_code)
+            if sample_code in sample_code_to_id:
+                core_id = sample_code_to_id[sample_code]
             else:
-                core_id = int(core_exists.iloc[0]["id"])
+                core_id = db.add_core_sample(station_id, sample_code)
+                sample_code_to_id[sample_code] = core_id
 
             layer_data = {
                 "layer_name": str(row["layer_name"]).strip(),
@@ -174,7 +200,40 @@ def import_csv(file, file_name: str) -> Tuple[int, List[Dict[str, Any]]]:
             errors.append(error_info)
             db.log_import_error(file_name, row_num, str(row.to_dict()), str(e))
 
-    return success_count, errors
+    return success_count, skipped_count, errors
+
+
+def validate_layer_edit(core_id: int, layer_id: int, depth_start: float, depth_end: float) -> Tuple[bool, str]:
+    if depth_start >= depth_end:
+        return False, f"深度起点({depth_start})必须小于终点({depth_end})"
+
+    if depth_start < 0 or depth_end < 0:
+        return False, "深度值不能为负数"
+
+    layers_df = db.get_core_layers(core_id)
+    if not layers_df.empty:
+        for _, row in layers_df.iterrows():
+            if int(row["id"]) == layer_id:
+                continue
+            s = float(row["depth_start"])
+            e = float(row["depth_end"])
+            if not (depth_end <= s or depth_start >= e):
+                return False, f"深度区间({depth_start}-{depth_end})与已有层位「{row['layer_name']}」({s}-{e})重叠"
+
+    return True, ""
+
+
+def validate_percentages(gravel_pct: float, sand_pct: float, silt_pct: float, clay_pct: float) -> Tuple[bool, str]:
+    pcts = [("砾石", gravel_pct), ("砂", sand_pct), ("粉砂", silt_pct), ("黏土", clay_pct)]
+    for name, val in pcts:
+        if val < 0:
+            return False, f"{name}百分比为负数({val})"
+
+    total = gravel_pct + sand_pct + silt_pct + clay_pct
+    if total > 100.1:
+        return False, f"颗粒组成百分比总和({total:.1f}%)超过100%"
+
+    return True, ""
 
 
 def get_expected_columns() -> Dict[str, List[str]]:

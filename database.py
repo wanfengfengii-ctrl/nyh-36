@@ -1,6 +1,7 @@
 import sqlite3
 import pandas as pd
-from typing import Optional, List, Dict, Any
+import json
+from typing import Optional, List, Dict, Any, Tuple
 
 
 DB_PATH = "sediment_data.db"
@@ -33,7 +34,9 @@ def init_db() -> None:
             sample_code TEXT UNIQUE NOT NULL,
             core_length REAL,
             sampling_date TEXT,
+            version INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (station_id) REFERENCES stations(id)
         )
     """)
@@ -52,24 +55,149 @@ def init_db() -> None:
             organic_matter REAL,
             water_content REAL,
             notes TEXT,
+            is_duplicate INTEGER DEFAULT 0,
+            duplicate_of INTEGER,
+            is_overlap INTEGER DEFAULT 0,
+            overlap_with TEXT,
+            is_anomaly INTEGER DEFAULT 0,
+            anomaly_status TEXT DEFAULT 'pending',
+            anomaly_notes TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (core_id) REFERENCES core_samples(id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS layer_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            layer_id INTEGER NOT NULL,
+            core_id INTEGER NOT NULL,
+            version INTEGER NOT NULL,
+            layer_name TEXT,
+            depth_start REAL,
+            depth_end REAL,
+            gravel_pct REAL,
+            sand_pct REAL,
+            silt_pct REAL,
+            clay_pct REAL,
+            organic_matter REAL,
+            water_content REAL,
+            notes TEXT,
+            change_reason TEXT,
+            changed_by TEXT DEFAULT 'system',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (layer_id) REFERENCES layers(id),
+            FOREIGN KEY (core_id) REFERENCES core_samples(id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS anomaly_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            layer_id INTEGER NOT NULL,
+            core_id INTEGER NOT NULL,
+            anomaly_type TEXT NOT NULL,
+            anomaly_details TEXT,
+            status TEXT DEFAULT 'pending',
+            reviewer TEXT,
+            review_notes TEXT,
+            reviewed_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (layer_id) REFERENCES layers(id),
+            FOREIGN KEY (core_id) REFERENCES core_samples(id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS import_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_name TEXT NOT NULL,
+            file_hash TEXT,
+            total_rows INTEGER DEFAULT 0,
+            success_count INTEGER DEFAULT 0,
+            skipped_count INTEGER DEFAULT 0,
+            error_count INTEGER DEFAULT 0,
+            duplicate_count INTEGER DEFAULT 0,
+            overlap_count INTEGER DEFAULT 0,
+            import_mode TEXT DEFAULT 'append',
+            session_note TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS import_errors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER,
             file_name TEXT NOT NULL,
             row_number INTEGER,
             row_data TEXT,
+            error_type TEXT DEFAULT 'validation',
             error_reason TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (session_id) REFERENCES import_sessions(id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS export_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            export_type TEXT NOT NULL,
+            scope TEXT,
+            filters TEXT,
+            record_count INTEGER,
+            file_name TEXT,
+            export_format TEXT DEFAULT 'csv',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
+    _migrate_existing_tables(cursor)
+
     conn.commit()
     conn.close()
+
+
+def _migrate_existing_tables(cursor: sqlite3.Cursor) -> None:
+    try:
+        cursor.execute("PRAGMA table_info(core_samples)")
+        columns = [col["name"] for col in cursor.fetchall()]
+        if "version" not in columns:
+            cursor.execute("ALTER TABLE core_samples ADD COLUMN version INTEGER DEFAULT 1")
+        if "updated_at" not in columns:
+            cursor.execute("ALTER TABLE core_samples ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("PRAGMA table_info(layers)")
+        columns = [col["name"] for col in cursor.fetchall()]
+        new_columns = [
+            ("is_duplicate", "INTEGER DEFAULT 0"),
+            ("duplicate_of", "INTEGER"),
+            ("is_overlap", "INTEGER DEFAULT 0"),
+            ("overlap_with", "TEXT"),
+            ("is_anomaly", "INTEGER DEFAULT 0"),
+            ("anomaly_status", "TEXT DEFAULT 'pending'"),
+            ("anomaly_notes", "TEXT"),
+            ("updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+        ]
+        for col_name, col_def in new_columns:
+            if col_name not in columns:
+                cursor.execute(f"ALTER TABLE layers ADD COLUMN {col_name} {col_def}")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("PRAGMA table_info(import_errors)")
+        columns = [col["name"] for col in cursor.fetchall()]
+        if "session_id" not in columns:
+            cursor.execute("ALTER TABLE import_errors ADD COLUMN session_id INTEGER")
+        if "error_type" not in columns:
+            cursor.execute("ALTER TABLE import_errors ADD COLUMN error_type TEXT DEFAULT 'validation'")
+    except sqlite3.OperationalError:
+        pass
 
 
 def add_station(station_code: str, station_name: str = "", location: str = "") -> int:
