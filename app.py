@@ -13,6 +13,7 @@ import analyzer
 import visualizer
 import quality_control as qc
 import alignment_engine as align
+import chronology_engine as chrono
 
 
 st.set_page_config(
@@ -109,6 +110,7 @@ with st.sidebar:
             "📈 多柱样对比",
             "🔗 层位对齐与区域演化",
             "🎯 质量控制工作台",
+            "⏳ 年代约束与沉积速率",
             "⚙️ 数据管理与版本"
         ]
     )
@@ -2170,6 +2172,1030 @@ elif page == "🎯 质量控制工作台":
                 labels={"x": "异常类型", "y": "数量"}
             )
             st.plotly_chart(fig_type, use_container_width=True)
+
+
+elif page == "⏳ 年代约束与沉积速率":
+    st.header("⏳ 年代约束与沉积速率反演分析")
+    st.caption("基于年代测定数据构建年龄-深度模型，反演沉积速率并进行时空演化对比分析")
+
+    filters = st.session_state.filters
+    cores_df = analyzer.filter_cores(filters)
+
+    if cores_df.empty:
+        st.info("暂无沉积柱样数据，请先导入CSV文件或调整筛选条件。")
+    else:
+        chrono_main_tabs = st.tabs([
+            "📋 数据总览",
+            "📍 年代点录入与校验",
+            "📐 年龄-深度模型拟合",
+            "📊 沉积速率计算",
+            "⏱️ 时间剖面图",
+            "🔍 异常年代点识别",
+            "🔗 层位时间对比",
+            "🌐 多站位沉积演化对比",
+            "✏️ 模型修正与备注",
+            "📤 分析报告导出"
+        ])
+
+        with chrono_main_tabs[0]:
+            st.subheader("年代约束数据总览")
+            all_core_ids = cores_df["id"].tolist()
+            chrono_summary = chrono.get_chronology_summary(all_core_ids)
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("柱样总数", len(all_core_ids))
+            with col2:
+                with_chrono = chrono_summary[chrono_summary["has_chronology"]].shape[0] if not chrono_summary.empty else 0
+                st.metric("已有年代约束", with_chrono,
+                          delta=f"{with_chrono/len(all_core_ids)*100:.1f}%" if all_core_ids else "0%")
+            with col3:
+                total_points = chrono_summary["dating_point_count"].sum() if not chrono_summary.empty else 0
+                st.metric("年代点总数", int(total_points))
+            with col4:
+                total_models = chrono_summary["model_count"].sum() if not chrono_summary.empty else 0
+                st.metric("已建模型数", int(total_models))
+
+            if not chrono_summary.empty:
+                display_summary = chrono_summary.copy()
+                display_summary.columns = [
+                    "柱样ID", "站位", "样品编号", "年代点数",
+                    "模型数", "平均沉积速率(cm/ka)", "已有年代约束"
+                ]
+                st.dataframe(display_summary, use_container_width=True, hide_index=True)
+
+                if not chrono_summary.empty and chrono_summary["dating_point_count"].sum() > 0:
+                    fig_stats = visualizer.plot_chronology_stats(chrono_summary)
+                    st.plotly_chart(fig_stats, use_container_width=True)
+
+        with chrono_main_tabs[1]:
+            st.subheader("年代点录入与校验")
+
+            core_options = dict(zip(cores_df["sample_code"], cores_df["id"]))
+            selected_core = st.selectbox(
+                "选择沉积柱样",
+                list(core_options.keys()),
+                key="dating_point_core_select"
+            )
+            selected_core_id = core_options[selected_core]
+            core_info = db.get_core_sample(selected_core_id)
+            core_length = core_info.get("core_length") if core_info else None
+
+            col_a, col_b = st.columns([1, 1])
+            with col_a:
+                st.markdown("#### 录入单一年代点")
+                with st.form("add_dating_point_form", clear_on_submit=True):
+                    dp_depth = st.number_input("深度 (cm)", min_value=0.0, step=1.0,
+                                               max_value=float(core_length) if core_length else 10000.0,
+                                               help="年代控制点的深度位置")
+                    dp_age = st.number_input("年龄 (a BP)", min_value=0.0, step=10.0,
+                                             help="距今年代，单位为年前 (a BP)")
+                    dp_age_error = st.number_input("年龄误差 (±a)", min_value=0.0, step=1.0, value=0.0)
+                    dp_method = st.selectbox("测年方法", chrono.DATING_METHODS)
+                    dp_label = st.text_input("样品标签/编号", placeholder="如: C-14-001")
+                    dp_notes = st.text_area("备注", placeholder="测年实验室、材料类型等说明...")
+
+                    submitted = st.form_submit_button("➕ 添加年代点", type="primary")
+                    if submitted:
+                        existing_points = db.get_dating_points(selected_core_id)
+                        validation = chrono.validate_dating_point(
+                            dp_depth, dp_age, core_length, existing_points
+                        )
+                        if not validation["valid"]:
+                            for err in validation["errors"]:
+                                st.error(f"❌ {err}")
+                        else:
+                            point_id = db.add_dating_point(
+                                selected_core_id, dp_depth, dp_age, dp_age_error,
+                                dp_method, dp_label, dp_notes
+                            )
+                            st.success(f"✅ 年代点已添加 (ID: {point_id})")
+                            if validation["warnings"]:
+                                for warn in validation["warnings"]:
+                                    st.warning(f"⚠️ {warn}")
+                            st.rerun()
+
+            with col_b:
+                st.markdown("#### 批量导入年代点")
+                st.info("CSV格式：depth,age,age_error,dating_method,sample_label,notes")
+                batch_file = st.file_uploader("上传年代点CSV文件", type=["csv"], key="batch_dating_upload")
+                if batch_file is not None:
+                    try:
+                        batch_df = pd.read_csv(batch_file)
+                        st.write(f"预览 ({len(batch_df)} 条记录):")
+                        st.dataframe(batch_df.head(), use_container_width=True)
+
+                        if st.button("🚀 批量导入", key="batch_import_dating"):
+                            existing_points = db.get_dating_points(selected_core_id)
+                            success_count = 0
+                            error_count = 0
+                            for _, row in batch_df.iterrows():
+                                validation = chrono.validate_dating_point(
+                                    row.get("depth"), row.get("age"),
+                                    core_length, existing_points
+                                )
+                                if validation["valid"]:
+                                    db.add_dating_point(
+                                        selected_core_id,
+                                        float(row.get("depth", 0)),
+                                        float(row.get("age", 0)),
+                                        float(row.get("age_error", 0)) if pd.notna(row.get("age_error")) else None,
+                                        str(row.get("dating_method", "")),
+                                        str(row.get("sample_label", "")),
+                                        str(row.get("notes", ""))
+                                    )
+                                    success_count += 1
+                                else:
+                                    error_count += 1
+                            st.success(f"✅ 导入完成：成功 {success_count} 条，失败 {error_count} 条")
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"文件解析失败: {str(e)}")
+
+            st.divider()
+            st.markdown("#### 已录入年代点列表")
+            dating_points_df = db.get_dating_points(selected_core_id)
+
+            if dating_points_df.empty:
+                st.info("该柱样暂未录入年代点数据")
+            else:
+                display_dp = dating_points_df.copy()
+                display_dp["状态"] = display_dp.apply(
+                    lambda r: "🔴 异常" if r.get("is_anomaly", 0) == 1
+                    else ("⚪ 已排除" if r.get("is_valid", 1) == 0 else "🟢 有效"),
+                    axis=1
+                )
+                display_cols = ["id", "depth", "age", "age_error", "dating_method",
+                                "sample_label", "状态", "notes"]
+                display_names = ["ID", "深度(cm)", "年龄(a BP)", "误差(±a)", "测年方法",
+                                 "样品标签", "状态", "备注"]
+                display_dp = display_dp[display_cols]
+                display_dp.columns = display_names
+                st.dataframe(display_dp, use_container_width=True, hide_index=True)
+
+                with st.expander("批量操作年代点"):
+                    col_act1, col_act2, col_act3 = st.columns(3)
+                    with col_act1:
+                        point_ids = dating_points_df["id"].tolist()
+                        point_options = [f"#{pid} - {dating_points_df[dating_points_df['id']==pid]['depth'].values[0]}cm"
+                                         for pid in point_ids]
+                        edit_pid = st.selectbox("选择要编辑的年代点", point_options, key="edit_dp_select")
+                        edit_id = point_ids[point_options.index(edit_pid)]
+                        dp_data = db.get_dating_point(edit_id)
+                        if dp_data:
+                            new_depth = st.number_input("新深度", value=float(dp_data["depth"]), step=1.0)
+                            new_age = st.number_input("新年龄", value=float(dp_data["age"]), step=10.0)
+                            new_notes = st.text_input("备注", value=dp_data.get("notes", ""))
+                            if st.button("💾 保存修改", key="save_dp_edit"):
+                                db.update_dating_point(edit_id, depth=new_depth, age=new_age, notes=new_notes)
+                                st.success("已更新")
+                                st.rerun()
+                    with col_act2:
+                        del_pid = st.selectbox("选择要删除的年代点", point_options, key="del_dp_select")
+                        del_id = point_ids[point_options.index(del_pid)]
+                        if st.button("🗑️ 删除年代点", type="secondary", key="delete_dp"):
+                            db.delete_dating_point(del_id)
+                            st.success("已删除")
+                            st.rerun()
+                    with col_act3:
+                        toggle_pid = st.selectbox("选择年代点", point_options, key="toggle_dp_select")
+                        toggle_id = point_ids[point_options.index(toggle_pid)]
+                        toggle_dp = db.get_dating_point(toggle_id)
+                        current_valid = toggle_dp.get("is_valid", 1) if toggle_dp else 1
+                        action_label = "🔓 恢复为有效" if current_valid == 0 else "🔒 标记为无效/排除"
+                        if st.button(action_label, key="toggle_dp_valid"):
+                            db.update_dating_point(toggle_id, is_valid=0 if current_valid == 1 else 1)
+                            st.success("状态已更新")
+                            st.rerun()
+
+                fig_ad = visualizer.plot_age_depth_scatter(dating_points_df)
+                st.plotly_chart(fig_ad, use_container_width=True)
+
+        with chrono_main_tabs[2]:
+            st.subheader("年龄-深度模型拟合")
+
+            core_options = dict(zip(cores_df["sample_code"], cores_df["id"]))
+            model_core = st.selectbox("选择沉积柱样", list(core_options.keys()),
+                                      key="model_core_select")
+            model_core_id = core_options[model_core]
+
+            dating_points = db.get_dating_points(model_core_id, valid_only=True)
+
+            if dating_points.empty or len(dating_points) < 2:
+                st.warning("⚠️ 至少需要2个有效年代点才能拟合模型。请先在「年代点录入」中添加数据。")
+            else:
+                col_m1, col_m2 = st.columns(2)
+                with col_m1:
+                    model_type = st.selectbox(
+                        "选择拟合模型类型",
+                        list(chrono.MODEL_TYPES.keys()),
+                        format_func=lambda x: chrono.MODEL_TYPES[x],
+                        key="model_type_select"
+                    )
+                    smooth_factor = 0.0
+                    if model_type == "spline":
+                        smooth_factor = st.slider("样条平滑因子", 0.0, 10.0, 0.0, 0.1)
+
+                with col_m2:
+                    st.markdown("#### 拟合参数设置")
+                    model_name = st.text_input("模型名称",
+                                               value=f"{model_core}_{chrono.MODEL_TYPES[model_type]}_{datetime.now().strftime('%Y%m%d')}")
+                    model_notes = st.text_area("模型备注", placeholder="模型构建说明、数据来源、特殊处理等...")
+                    exclude_anomalies = st.checkbox("排除异常年代点", value=True)
+
+                if exclude_anomalies:
+                    fit_points = dating_points[dating_points.get("is_anomaly", 0) == 0].copy()
+                else:
+                    fit_points = dating_points.copy()
+
+                if st.button("🔬 开始拟合模型", type="primary", key="fit_model_btn"):
+                    with st.spinner("正在拟合模型..."):
+                        model_result = chrono.fit_age_depth_model(fit_points, model_type, smooth_factor)
+                        st.session_state[f"current_model_{model_core_id}"] = model_result
+
+                        if model_result["success"]:
+                            model_id = db.add_age_depth_model(
+                                model_core_id, model_name, model_type,
+                                model_result.get("model_params"),
+                                model_result.get("r_squared"),
+                                model_result.get("rmse"),
+                                notes=model_notes
+                            )
+                            st.session_state[f"current_model_id_{model_core_id}"] = model_id
+                            st.success(f"✅ 模型拟合成功！模型ID: {model_id}")
+                        else:
+                            st.error(f"❌ 模型拟合失败: {model_result.get('error', '未知错误')}")
+
+                if f"current_model_{model_core_id}" in st.session_state:
+                    model_result = st.session_state[f"current_model_{model_core_id}"]
+
+                    col_r1, col_r2, col_r3 = st.columns(3)
+                    with col_r1:
+                        st.metric("模型类型", chrono.MODEL_TYPES.get(model_result.get("model_type", ""), "未知"))
+                    with col_r2:
+                        r2 = model_result.get("r_squared")
+                        st.metric("R²", f"{r2:.4f}" if r2 is not None else "N/A")
+                    with col_r3:
+                        rmse = model_result.get("rmse")
+                        st.metric("RMSE", f"{rmse:.2f}" if rmse is not None else "N/A")
+
+                    fig_model = visualizer.plot_age_depth_scatter(dating_points, model_result)
+                    st.plotly_chart(fig_model, use_container_width=True)
+
+                    with st.expander("查看模型参数详情"):
+                        params = model_result.get("model_params", {})
+                        if params:
+                            st.json(params)
+
+                st.divider()
+                st.markdown("#### 已保存的模型")
+                saved_models = db.get_age_depth_models(model_core_id)
+                if saved_models.empty:
+                    st.info("暂无已保存的模型")
+                else:
+                    saved_models_display = saved_models.copy()
+                    saved_models_display["model_type_display"] = saved_models_display["model_type"].map(
+                        lambda x: chrono.MODEL_TYPES.get(x, x)
+                    )
+                    saved_models_display = saved_models_display[[
+                        "id", "model_name", "model_type_display", "r_squared", "rmse", "notes", "created_at"
+                    ]]
+                    saved_models_display.columns = ["ID", "模型名称", "类型", "R²", "RMSE", "备注", "创建时间"]
+                    st.dataframe(saved_models_display, use_container_width=True, hide_index=True)
+
+                    col_load, col_del = st.columns(2)
+                    with col_load:
+                        load_model_id = st.selectbox(
+                            "选择模型ID进行加载",
+                            saved_models["id"].tolist(),
+                            key="load_model_select"
+                        )
+                        if st.button("📂 加载此模型", key="load_saved_model"):
+                            loaded_model = db.get_age_depth_model(load_model_id)
+                            if loaded_model:
+                                params = loaded_model.get("model_params")
+                                if isinstance(params, str):
+                                    try:
+                                        params = json.loads(params)
+                                    except:
+                                        params = {}
+                                model_result = {
+                                    "success": True,
+                                    "model_type": loaded_model["model_type"],
+                                    "model_params": params or {},
+                                    "r_squared": loaded_model.get("r_squared"),
+                                    "rmse": loaded_model.get("rmse"),
+                                    "depths": fit_points["depth"].tolist() if not fit_points.empty else [],
+                                    "ages": fit_points["age"].tolist() if not fit_points.empty else [],
+                                }
+                                st.session_state[f"current_model_{model_core_id}"] = model_result
+                                st.session_state[f"current_model_id_{model_core_id}"] = load_model_id
+                                st.success("✅ 模型已加载")
+                                st.rerun()
+                    with col_del:
+                        del_model_id = st.selectbox(
+                            "选择模型ID进行删除",
+                            saved_models["id"].tolist(),
+                            key="del_model_select"
+                        )
+                        if st.button("🗑️ 删除模型", key="delete_model", type="secondary"):
+                            db.delete_age_depth_model(del_model_id)
+                            st.success("已删除")
+                            st.rerun()
+
+        with chrono_main_tabs[3]:
+            st.subheader("沉积速率分段计算")
+
+            core_options = dict(zip(cores_df["sample_code"], cores_df["id"]))
+            rate_core = st.selectbox("选择沉积柱样", list(core_options.keys()),
+                                     key="rate_core_select")
+            rate_core_id = core_options[rate_core]
+
+            if f"current_model_{rate_core_id}" not in st.session_state:
+                saved_models = db.get_age_depth_models(rate_core_id)
+                if saved_models.empty:
+                    st.warning("⚠️ 请先在「年龄-深度模型拟合」中构建或加载模型")
+                else:
+                    latest = saved_models.iloc[0]
+                    params = latest.get("model_params")
+                    if isinstance(params, str):
+                        try:
+                            params = json.loads(params)
+                        except:
+                            params = {}
+                    fit_points = db.get_dating_points(rate_core_id, valid_only=True)
+                    model_result = {
+                        "success": True,
+                        "model_type": latest["model_type"],
+                        "model_params": params or {},
+                        "r_squared": latest.get("r_squared"),
+                        "rmse": latest.get("rmse"),
+                        "depths": fit_points["depth"].tolist() if not fit_points.empty else [],
+                        "ages": fit_points["age"].tolist() if not fit_points.empty else [],
+                    }
+                    st.session_state[f"current_model_{rate_core_id}"] = model_result
+                    st.session_state[f"current_model_id_{rate_core_id}"] = latest["id"]
+                    st.info(f"ℹ️ 已自动加载最新模型: {latest['model_name']}")
+
+            if f"current_model_{rate_core_id}" in st.session_state:
+                model_result = st.session_state[f"current_model_{rate_core_id}"]
+                core_info = db.get_core_sample(rate_core_id)
+                layers_df = db.get_core_layers(rate_core_id)
+
+                col_s1, col_s2 = st.columns(2)
+                with col_s1:
+                    use_layers = st.checkbox("按层位分段计算", value=True,
+                                             help="勾选则按每层计算，否则按年代点间隔计算")
+                with col_s2:
+                    core_length = core_info.get("core_length") if core_info else None
+                    extend_to_bottom = st.checkbox("延伸到柱样底部", value=True)
+
+                if st.button("📊 计算沉积速率", type="primary", key="calc_rates_btn"):
+                    with st.spinner("正在计算沉积速率..."):
+                        layers_for_rate = layers_df if use_layers and not layers_df.empty else None
+                        rates_df = chrono.calculate_sedimentation_rates(
+                            model_result,
+                            layers_for_rate,
+                            max_depth=float(core_length) if (extend_to_bottom and core_length) else None
+                        )
+                        st.session_state[f"rates_df_{rate_core_id}"] = rates_df
+
+                        model_id = st.session_state.get(f"current_model_id_{rate_core_id}")
+                        if model_id and not rates_df.empty:
+                            db.delete_sedimentation_rates(model_id)
+                            for _, row in rates_df.iterrows():
+                                db.add_sedimentation_rate(
+                                    rate_core_id, model_id,
+                                    float(row["depth_start"]), float(row["depth_end"]),
+                                    float(row["age_start"]), float(row["age_end"]),
+                                    float(row["sedimentation_rate"])
+                                )
+
+                if f"rates_df_{rate_core_id}" in st.session_state:
+                    rates_df = st.session_state[f"rates_df_{rate_core_id}"]
+
+                    if rates_df.empty:
+                        st.warning("未计算出沉积速率数据")
+                    else:
+                        col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
+                        with col_stat1:
+                            st.metric("速率段数", len(rates_df))
+                        with col_stat2:
+                            st.metric("平均速率", f"{rates_df['sedimentation_rate'].mean():.2f} cm/ka")
+                        with col_stat3:
+                            st.metric("最大速率", f"{rates_df['sedimentation_rate'].max():.2f} cm/ka")
+                        with col_stat4:
+                            st.metric("最小速率", f"{rates_df['sedimentation_rate'].min():.2f} cm/ka")
+
+                        fig_rates = visualizer.plot_sedimentation_rate(rates_df)
+                        st.plotly_chart(fig_rates, use_container_width=True)
+
+                        display_rates = rates_df.copy()
+                        if "layer_name" in display_rates.columns:
+                            display_rates = display_rates[[
+                                "layer_name", "depth_start", "depth_end",
+                                "age_start", "age_end", "age_duration",
+                                "thickness", "sedimentation_rate"
+                            ]]
+                            display_rates.columns = [
+                                "层位名称", "深度起点(cm)", "深度终点(cm)",
+                                "年龄起点(a BP)", "年龄终点(a BP)", "历时(a)",
+                                "厚度(cm)", "沉积速率(cm/ka)"
+                            ]
+                        else:
+                            display_rates = display_rates[[
+                                "depth_start", "depth_end",
+                                "age_start", "age_end", "age_duration",
+                                "thickness", "sedimentation_rate"
+                            ]]
+                            display_rates.columns = [
+                                "深度起点(cm)", "深度终点(cm)",
+                                "年龄起点(a BP)", "年龄终点(a BP)", "历时(a)",
+                                "厚度(cm)", "沉积速率(cm/ka)"
+                            ]
+                        st.dataframe(display_rates, use_container_width=True, hide_index=True)
+
+        with chrono_main_tabs[4]:
+            st.subheader("时间剖面图")
+            st.caption("将空间深度序列转换为时间序列的沉积剖面展示")
+
+            core_options = dict(zip(cores_df["sample_code"], cores_df["id"]))
+            ts_core = st.selectbox("选择沉积柱样", list(core_options.keys()),
+                                   key="timesection_core_select")
+            ts_core_id = core_options[ts_core]
+
+            layers_df = db.get_core_layers(ts_core_id)
+
+            if f"current_model_{ts_core_id}" not in st.session_state:
+                saved_models = db.get_age_depth_models(ts_core_id)
+                if not saved_models.empty:
+                    latest = saved_models.iloc[0]
+                    params = latest.get("model_params")
+                    if isinstance(params, str):
+                        try:
+                            params = json.loads(params)
+                        except:
+                            params = {}
+                    fit_points = db.get_dating_points(ts_core_id, valid_only=True)
+                    model_result = {
+                        "success": True,
+                        "model_type": latest["model_type"],
+                        "model_params": params or {},
+                        "r_squared": latest.get("r_squared"),
+                        "rmse": latest.get("rmse"),
+                        "depths": fit_points["depth"].tolist() if not fit_points.empty else [],
+                        "ages": fit_points["age"].tolist() if not fit_points.empty else [],
+                    }
+                    st.session_state[f"current_model_{ts_core_id}"] = model_result
+                    st.session_state[f"current_model_id_{ts_core_id}"] = latest["id"]
+
+            if f"current_model_{ts_core_id}" in st.session_state and not layers_df.empty:
+                model_result = st.session_state[f"current_model_{ts_core_id}"]
+
+                col_view1, col_view2 = st.columns(2)
+                with col_view1:
+                    st.markdown("##### 空间深度剖面")
+                    core_analysis = analyzer.get_core_analysis(ts_core_id)
+                    missing = core_analysis.get("missing_intervals", [])
+                    fig_depth = visualizer.plot_core_section(layers_df, missing)
+                    st.plotly_chart(fig_depth, use_container_width=True)
+
+                with col_view2:
+                    st.markdown("##### 时间剖面（年龄尺度）")
+                    fig_time = visualizer.plot_time_section(layers_df, model_result)
+                    st.plotly_chart(fig_time, use_container_width=True)
+
+                with st.expander("查看每层对应的时间区间"):
+                    time_layers = []
+                    import chronology_engine as ce
+                    for _, row in layers_df.iterrows():
+                        d_start = row["depth_start"]
+                        d_end = row["depth_end"]
+                        a_start = chrono.predict_age(model_result, float(d_start))
+                        a_end = chrono.predict_age(model_result, float(d_end))
+                        time_layers.append({
+                            "层位名称": row["layer_name"],
+                            "深度(cm)": f"{d_start:.1f} - {d_end:.1f}",
+                            "年龄(a BP)": f"{a_start:.1f} - {a_end:.1f}" if (a_start and a_end) else "N/A",
+                            "历时(a)": f"{a_end - a_start:.1f}" if (a_start and a_end and a_end > a_start) else "N/A",
+                        })
+                    st.dataframe(pd.DataFrame(time_layers), use_container_width=True, hide_index=True)
+
+            elif layers_df.empty:
+                st.info("该柱样暂无层位数据")
+
+        with chrono_main_tabs[5]:
+            st.subheader("异常年代点识别")
+            st.caption("基于统计方法自动检测可能存在问题的年代控制点")
+
+            core_options = dict(zip(cores_df["sample_code"], cores_df["id"]))
+            anom_core = st.selectbox("选择沉积柱样", list(core_options.keys()),
+                                     key="anomaly_core_select")
+            anom_core_id = core_options[anom_core]
+
+            dating_points = db.get_dating_points(anom_core_id)
+
+            if dating_points.empty or len(dating_points) < 4:
+                st.warning("⚠️ 至少需要4个年代点才能进行异常检测")
+            else:
+                col_an1, col_an2 = st.columns(2)
+                with col_an1:
+                    anomaly_method = st.selectbox(
+                        "异常检测方法",
+                        ["zscore", "iqr"],
+                        format_func=lambda x: {"zscore": "Z-score法 (推荐)", "iqr": "四分位距法(IQR)"}.get(x, x)
+                    )
+                with col_an2:
+                    z_threshold = st.slider("Z-score阈值", 1.5, 4.0, 2.5, 0.1,
+                                            help="值越大检测越严格，异常点越少")
+
+                if st.button("🔍 开始异常检测", type="primary", key="run_anomaly_detect"):
+                    with st.spinner("正在检测异常点..."):
+                        anomaly_df = chrono.detect_anomalous_points(dating_points, anomaly_method, z_threshold)
+
+                        for _, row in anomaly_df.iterrows():
+                            db.update_dating_point(
+                                int(row["id"]),
+                                is_anomaly=1 if row["is_anomaly"] else 0,
+                                anomaly_reason=row.get("anomaly_reason", "")
+                            )
+
+                        detected = anomaly_df["is_anomaly"].sum()
+                        st.success(f"✅ 检测完成：共发现 {int(detected)} 个异常点")
+                        st.rerun()
+
+                dating_points = db.get_dating_points(anom_core_id)
+
+                anomaly_points = dating_points[dating_points.get("is_anomaly", 0) == 1]
+                normal_points = dating_points[dating_points.get("is_anomaly", 0) == 0]
+
+                col_cnt1, col_cnt2 = st.columns(2)
+                with col_cnt1:
+                    st.metric("异常年代点", len(anomaly_points), delta_color="inverse")
+                with col_cnt2:
+                    st.metric("正常年代点", len(normal_points))
+
+                fig_anomaly = visualizer.plot_age_depth_scatter(dating_points)
+                st.plotly_chart(fig_anomaly, use_container_width=True)
+
+                if not anomaly_points.empty:
+                    st.markdown("#### 检测到的异常点")
+                    anom_display = anomaly_points[["id", "depth", "age", "dating_method", "anomaly_reason"]].copy()
+                    anom_display.columns = ["ID", "深度(cm)", "年龄(a BP)", "测年方法", "异常原因"]
+                    st.dataframe(anom_display, use_container_width=True, hide_index=True)
+
+                    with st.expander("批量处理异常点"):
+                        anom_ids = anomaly_points["id"].tolist()
+                        anom_options = [f"#{pid} - {anomaly_points[anomaly_points['id']==pid]['depth'].values[0]}cm"
+                                        for pid in anom_ids]
+                        handle_pid = st.selectbox("选择异常点", anom_options, key="handle_anomaly_select")
+                        handle_id = anom_ids[anom_options.index(handle_pid)]
+
+                        col_h1, col_h2, col_h3 = st.columns(3)
+                        with col_h1:
+                            if st.button("🔓 标记为正常", key="mark_normal"):
+                                db.update_dating_point(handle_id, is_anomaly=0, anomaly_reason="")
+                                st.success("已标记为正常")
+                                st.rerun()
+                        with col_h2:
+                            if st.button("🔒 排除此点", key="exclude_anomaly"):
+                                db.update_dating_point(handle_id, is_valid=0)
+                                st.success("已排除")
+                                st.rerun()
+                        with col_h3:
+                            new_note = st.text_input("修正备注", key="anomaly_note")
+                            if st.button("💾 保存备注", key="save_anomaly_note"):
+                                db.update_dating_point(handle_id, notes=new_note)
+                                st.success("备注已保存")
+
+        with chrono_main_tabs[6]:
+            st.subheader("层位时间对比")
+            st.caption("比较两个柱样对应层位在时间尺度上的差异")
+
+            core_options = dict(zip(cores_df["sample_code"], cores_df["id"]))
+            col_cmp1, col_cmp2 = st.columns(2)
+            with col_cmp1:
+                cmp_core_a = st.selectbox("柱样 A", list(core_options.keys()), key="cmp_core_a")
+                cmp_core_a_id = core_options[cmp_core_a]
+            with col_cmp2:
+                other_options = [k for k in core_options.keys() if k != cmp_core_a]
+                cmp_core_b = st.selectbox("柱样 B", other_options, key="cmp_core_b")
+                cmp_core_b_id = core_options[cmp_core_b]
+
+            def get_or_load_model(core_id, core_name):
+                if f"current_model_{core_id}" in st.session_state:
+                    return st.session_state[f"current_model_{core_id}"]
+                saved = db.get_age_depth_models(core_id)
+                if not saved.empty:
+                    latest = saved.iloc[0]
+                    params = latest.get("model_params")
+                    if isinstance(params, str):
+                        try:
+                            params = json.loads(params)
+                        except:
+                            params = {}
+                    fit_points = db.get_dating_points(core_id, valid_only=True)
+                    return {
+                        "success": True,
+                        "model_type": latest["model_type"],
+                        "model_params": params or {},
+                        "r_squared": latest.get("r_squared"),
+                        "rmse": latest.get("rmse"),
+                        "depths": fit_points["depth"].tolist() if not fit_points.empty else [],
+                        "ages": fit_points["age"].tolist() if not fit_points.empty else [],
+                    }
+                return None
+
+            model_a = get_or_load_model(cmp_core_a_id, cmp_core_a)
+            model_b = get_or_load_model(cmp_core_b_id, cmp_core_b)
+
+            if model_a is None or model_b is None:
+                missing = []
+                if model_a is None:
+                    missing.append(cmp_core_a)
+                if model_b is None:
+                    missing.append(cmp_core_b)
+                st.warning(f"⚠️ 柱样 {', '.join(missing)} 尚未建立年龄-深度模型")
+            else:
+                use_alignment = st.checkbox("使用层位对齐结果（如有）", value=False)
+
+                if st.button("📐 进行时间对比", type="primary", key="run_temporal_cmp"):
+                    with st.spinner("正在计算层位时间对比..."):
+                        alignment_groups = None
+                        if use_alignment:
+                            pass
+                        temporal_cmp_df = chrono.compare_layers_temporal(
+                            cmp_core_a_id, cmp_core_b_id,
+                            model_a, model_b,
+                            alignment_groups
+                        )
+                        st.session_state["temporal_cmp_df"] = temporal_cmp_df
+
+                if "temporal_cmp_df" in st.session_state:
+                    temporal_cmp_df = st.session_state["temporal_cmp_df"]
+                    if temporal_cmp_df.empty:
+                        st.warning("未找到可对比的层位对")
+                    else:
+                        col_tc1, col_tc2 = st.columns(2)
+                        with col_tc1:
+                            valid_cmp = temporal_cmp_df.dropna(subset=["age_diff"])
+                            if not valid_cmp.empty:
+                                st.metric("对比层数", len(valid_cmp))
+                                avg_diff = abs(valid_cmp["age_diff"]).mean()
+                                st.metric("平均|年龄差|", f"{avg_diff:.1f} a")
+                        with col_tc2:
+                            if not valid_cmp.empty:
+                                max_diff_row = valid_cmp.loc[abs(valid_cmp["age_diff"]).idxmax()]
+                                st.metric("最大年龄差",
+                                          f"{max_diff_row['age_diff']:.1f} a",
+                                          delta=f"{max_diff_row['layer_a']} vs {max_diff_row['layer_b']}")
+
+                        fig_tc = visualizer.plot_temporal_layer_comparison(temporal_cmp_df,
+                                                                             title=f"{cmp_core_a} vs {cmp_core_b} 层位时间对比")
+                        st.plotly_chart(fig_tc, use_container_width=True)
+
+                        display_tc = temporal_cmp_df.copy()
+                        display_tc = display_tc[[
+                            "layer_a", "depth_a", "age_a",
+                            "layer_b", "depth_b", "age_b",
+                            "age_diff"
+                        ]]
+                        display_tc.columns = [
+                            f"{cmp_core_a}层位", "深度A(cm)", f"年龄A(a BP)",
+                            f"{cmp_core_b}层位", "深度B(cm)", f"年龄B(a BP)",
+                            "年龄差(a)"
+                        ]
+                        st.dataframe(display_tc, use_container_width=True, hide_index=True)
+
+        with chrono_main_tabs[7]:
+            st.subheader("多站位沉积演化速率对比")
+            st.caption("对比多个柱样在时间尺度上的沉积速率变化")
+
+            all_stations = cores_df["station_code"].unique().tolist() if "station_code" in cores_df.columns else []
+            multi_select_mode = st.radio(
+                "选择模式",
+                ["按站位选择", "手动选择柱样"],
+                horizontal=True
+            )
+
+            selected_core_ids = []
+            if multi_select_mode == "按站位选择":
+                selected_stations = st.multiselect("选择站位", all_stations, default=all_stations[:min(3, len(all_stations))])
+                if selected_stations:
+                    for sc in selected_stations:
+                        station_cores = cores_df[cores_df["station_code"] == sc]
+                        selected_core_ids.extend(station_cores["id"].tolist())
+            else:
+                core_options_multi = dict(zip(cores_df["sample_code"], cores_df["id"]))
+                selected_core_codes = st.multiselect("选择柱样", list(core_options_multi.keys()),
+                                                      default=list(core_options_multi.keys())[:min(3, len(core_options_multi))])
+                selected_core_ids = [core_options_multi[c] for c in selected_core_codes]
+
+            if st.button("🌐 生成多站位对比图", type="primary", key="multi_station_compare"):
+                with st.spinner("正在计算多站位对比..."):
+                    models_dict = {}
+                    layers_dict = {}
+                    for cid in selected_core_ids:
+                        model = None
+                        if f"current_model_{cid}" in st.session_state:
+                            model = st.session_state[f"current_model_{cid}"]
+                        else:
+                            saved = db.get_age_depth_models(cid)
+                            if not saved.empty:
+                                latest = saved.iloc[0]
+                                params = latest.get("model_params")
+                                if isinstance(params, str):
+                                    try:
+                                        params = json.loads(params)
+                                    except:
+                                        params = {}
+                                fit_pts = db.get_dating_points(cid, valid_only=True)
+                                model = {
+                                    "success": True,
+                                    "model_type": latest["model_type"],
+                                    "model_params": params or {},
+                                    "depths": fit_pts["depth"].tolist() if not fit_pts.empty else [],
+                                    "ages": fit_pts["age"].tolist() if not fit_pts.empty else [],
+                                }
+                        if model and model.get("success"):
+                            models_dict[cid] = model
+                            layers_dict[cid] = db.get_core_layers(cid)
+
+                    comparison_df = chrono.compare_stations_sedimentation(
+                        selected_core_ids, models_dict, layers_dict
+                    )
+                    st.session_state["multi_station_comparison"] = comparison_df
+
+            if "multi_station_comparison" in st.session_state:
+                comparison_df = st.session_state["multi_station_comparison"]
+                if comparison_df.empty:
+                    st.warning("⚠️ 所选柱样中没有有效的年龄-深度模型。请先为各柱样构建模型。")
+                else:
+                    fig_multi = visualizer.plot_multi_station_sedimentation(comparison_df)
+                    st.plotly_chart(fig_multi, use_container_width=True)
+
+                    with st.expander("查看详细对比数据"):
+                        display_multi = comparison_df.copy()
+                        display_multi = display_multi[[
+                            "station_code", "sample_code", "depth_start", "depth_end",
+                            "age_start", "age_end", "sedimentation_rate"
+                        ]]
+                        display_multi.columns = [
+                            "站位", "柱样", "深度起点(cm)", "深度终点(cm)",
+                            "年龄起点(a BP)", "年龄终点(a BP)", "沉积速率(cm/ka)"
+                        ]
+                        st.dataframe(display_multi, use_container_width=True, hide_index=True)
+
+                    pivot_stats = comparison_df.groupby(["station_code", "sample_code"]).agg(
+                        平均速率=("sedimentation_rate", "mean"),
+                        最大速率=("sedimentation_rate", "max"),
+                        最小速率=("sedimentation_rate", "min"),
+                        速率标准差=("sedimentation_rate", "std")
+                    ).reset_index()
+                    st.markdown("#### 各柱样沉积速率统计")
+                    st.dataframe(pivot_stats, use_container_width=True, hide_index=True)
+
+        with chrono_main_tabs[8]:
+            st.subheader("模型人工修正与备注")
+            st.caption("对年龄-深度模型进行人工修正、添加说明和备注")
+
+            core_options = dict(zip(cores_df["sample_code"], cores_df["id"]))
+            ann_core = st.selectbox("选择沉积柱样", list(core_options.keys()),
+                                    key="annotation_core_select")
+            ann_core_id = core_options[ann_core]
+
+            saved_models = db.get_age_depth_models(ann_core_id)
+
+            if saved_models.empty:
+                st.info("该柱样暂无已保存的模型")
+            else:
+                model_id_options = dict(zip(saved_models["id"], saved_models["model_name"]))
+                selected_model_id = st.selectbox(
+                    "选择模型",
+                    list(model_id_options.keys()),
+                    format_func=lambda x: f"#{x} - {model_id_options[x]}",
+                    key="annotation_model_select"
+                )
+
+                tab_ann1, tab_ann2 = st.tabs(["📝 添加备注/修正", "📋 查看历史记录"])
+
+                with tab_ann1:
+                    col_ann_type, col_ann_target = st.columns(2)
+                    with col_ann_type:
+                        ann_type = st.selectbox(
+                            "备注类型",
+                            ["模型修正", "数据说明", "异常解释", "参考资料", "其他"],
+                            key="ann_type_select"
+                        )
+                    with col_ann_target:
+                        ann_target_type = st.selectbox(
+                            "目标类型",
+                            ["模型整体", "年代点", "模型参数"],
+                            key="ann_target_type"
+                        )
+
+                    ann_content = st.text_area(
+                        "备注/修正内容",
+                        height=120,
+                        placeholder="详细描述修正内容、原因、依据等...",
+                        key="ann_content"
+                    )
+                    ann_author = st.text_input("作者/修改人", value="geologist", key="ann_author")
+
+                    if st.button("💾 保存备注", type="primary", key="save_annotation"):
+                        if ann_content.strip():
+                            anno_id = db.add_chronology_annotation(
+                                ann_core_id, ann_type, ann_content.strip(),
+                                model_id=selected_model_id,
+                                target_type=ann_target_type,
+                                author=ann_author
+                            )
+                            st.success(f"✅ 备注已保存 (ID: {anno_id})")
+                            st.rerun()
+                        else:
+                            st.warning("⚠️ 备注内容不能为空")
+
+                    st.divider()
+                    st.markdown("#### 快速模型调整")
+                    st.caption("对现有模型进行简单调整，将生成新的模型版本")
+
+                    loaded_model = db.get_age_depth_model(selected_model_id)
+                    if loaded_model:
+                        st.write(f"当前模型: {loaded_model['model_name']} (类型: {chrono.MODEL_TYPES.get(loaded_model['model_type'], '未知')})")
+
+                        adjustment = st.radio(
+                            "调整方式",
+                            ["平移整体年龄", "调整地表年龄", "调整沉积速率"],
+                            horizontal=True
+                        )
+
+                        if adjustment == "平移整体年龄":
+                            shift_years = st.number_input("平移年数 (正=变老，负=变年轻)", step=10.0, value=0.0)
+                        elif adjustment == "调整地表年龄":
+                            new_surface_age = st.number_input("新的地表年龄 (a BP)", step=10.0, value=0.0)
+                        elif adjustment == "调整沉积速率":
+                            rate_factor = st.slider("速率倍率", 0.5, 2.0, 1.0, 0.05)
+
+                        if st.button("✨ 生成调整后模型", key="adjust_model"):
+                            params = loaded_model.get("model_params") or {}
+                            if isinstance(params, str):
+                                try:
+                                    params = json.loads(params)
+                                except:
+                                    params = {}
+
+                            if adjustment == "平移整体年龄" and "intercept" in params:
+                                params["intercept"] = float(params["intercept"]) + shift_years
+                            elif adjustment == "调整地表年龄" and "intercept" in params:
+                                params["intercept"] = float(new_surface_age)
+                            elif adjustment == "调整沉积速率" and "slope" in params:
+                                params["slope"] = float(params["slope"]) * rate_factor
+
+                            new_model_id = db.add_age_depth_model(
+                                ann_core_id,
+                                f"{loaded_model['model_name']}_adjusted_{datetime.now().strftime('%H%M%S')}",
+                                loaded_model["model_type"],
+                                params,
+                                loaded_model.get("r_squared"),
+                                loaded_model.get("rmse"),
+                                notes=f"基于模型#{selected_model_id}调整: {adjustment}"
+                            )
+                            db.add_chronology_annotation(
+                                ann_core_id, "模型修正",
+                                f"人工调整模型: {adjustment}，生成新模型#{new_model_id}",
+                                model_id=new_model_id,
+                                author=ann_author
+                            )
+                            st.success(f"✅ 已生成新模型 (ID: {new_model_id})")
+                            st.rerun()
+
+                with tab_ann2:
+                    annotations = db.get_chronology_annotations(ann_core_id, selected_model_id)
+                    if annotations.empty:
+                        st.info("暂无备注记录")
+                    else:
+                        for _, ann in annotations.iterrows():
+                            with st.container():
+                                col_hd, col_del = st.columns([10, 1])
+                                with col_hd:
+                                    st.markdown(f"**[{ann.get('annotation_type', '')}]** "
+                                                f"*{ann.get('author', '')}* "
+                                                f"- {ann.get('created_at', '')}")
+                                    st.write(ann.get("content", ""))
+                                with col_del:
+                                    if st.button("🗑️", key=f"del_ann_{ann['id']}", help="删除此备注"):
+                                        db.delete_chronology_annotation(ann["id"])
+                                        st.rerun()
+                                st.divider()
+
+        with chrono_main_tabs[9]:
+            st.subheader("分析报告导出")
+            st.caption("生成年代约束与沉积速率分析报告并导出")
+
+            core_options = dict(zip(cores_df["sample_code"], cores_df["id"]))
+            exp_core = st.selectbox("选择沉积柱样", list(core_options.keys()),
+                                    key="export_core_select")
+            exp_core_id = core_options[exp_core]
+
+            col_exp1, col_exp2 = st.columns(2)
+            with col_exp1:
+                export_format = st.radio("导出格式", ["TXT文本报告", "CSV数据", "Excel (多Sheet)"])
+            with col_exp2:
+                include_annotations = st.checkbox("包含备注与修正记录", value=True)
+                include_rates = st.checkbox("包含沉积速率数据", value=True)
+
+            dating_points = db.get_dating_points(exp_core_id)
+            saved_models = db.get_age_depth_models(exp_core_id)
+
+            if dating_points.empty:
+                st.warning("⚠️ 该柱样暂未录入年代点数据")
+            else:
+                model_result = None
+                if not saved_models.empty:
+                    latest = saved_models.iloc[0]
+                    params = latest.get("model_params")
+                    if isinstance(params, str):
+                        try:
+                            params = json.loads(params)
+                        except:
+                            params = {}
+                    fit_points = dating_points[dating_points.get("is_valid", 1) == 1]
+                    model_result = {
+                        "success": True,
+                        "model_type": latest["model_type"],
+                        "model_params": params or {},
+                        "r_squared": latest.get("r_squared"),
+                        "rmse": latest.get("rmse"),
+                        "depths": fit_points["depth"].tolist() if not fit_points.empty else [],
+                        "ages": fit_points["age"].tolist() if not fit_points.empty else [],
+                    }
+
+                rates_df = pd.DataFrame()
+                if model_result and model_result.get("success"):
+                    layers_df = db.get_core_layers(exp_core_id)
+                    rates_df = chrono.calculate_sedimentation_rates(
+                        model_result,
+                        layers_df if not layers_df.empty else None
+                    )
+
+                annotations_df = pd.DataFrame()
+                if include_annotations:
+                    annotations_df = db.get_chronology_annotations(exp_core_id)
+
+                if st.button("📄 生成分析报告", type="primary", key="gen_chronology_report"):
+                    with st.spinner("正在生成报告..."):
+                        report = chrono.generate_chronology_report(
+                            exp_core_id, dating_points,
+                            model_result or {"success": False, "error": "未建立模型"},
+                            rates_df if include_rates else pd.DataFrame(),
+                            annotations_df if include_annotations else None
+                        )
+                        st.session_state["chronology_report_text"] = report
+                        st.success("✅ 报告已生成")
+
+                if "chronology_report_text" in st.session_state:
+                    with st.expander("预览报告", expanded=True):
+                        st.text(st.session_state["chronology_report_text"])
+
+                    col_dl1, col_dl2 = st.columns(2)
+                    with col_dl1:
+                        st.download_button(
+                            label="⬇️ 下载TXT报告",
+                            data=st.session_state["chronology_report_text"],
+                            file_name=f"年代约束分析报告_{exp_core}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                            mime="text/plain",
+                            use_container_width=True
+                        )
+
+                    with col_dl2:
+                        if not dating_points.empty:
+                            output = BytesIO()
+                            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                                dating_points.copy().to_excel(writer, sheet_name="年代点", index=False)
+                                if model_result and not saved_models.empty:
+                                    saved_models.to_excel(writer, sheet_name="模型列表", index=False)
+                                if include_rates and not rates_df.empty:
+                                    rates_df.to_excel(writer, sheet_name="沉积速率", index=False)
+                                if include_annotations and not annotations_df.empty:
+                                    annotations_df.to_excel(writer, sheet_name="备注记录", index=False)
+
+                            excel_data = output.getvalue()
+                            st.download_button(
+                                label="⬇️ 下载Excel数据包",
+                                data=excel_data,
+                                file_name=f"年代约束数据包_{exp_core}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                use_container_width=True
+                            )
+
+                db.add_export_record(
+                    export_type="chronology_report",
+                    scope=exp_core,
+                    filters={"format": export_format},
+                    record_count=len(dating_points),
+                    file_name=f"年代约束分析报告_{exp_core}_{datetime.now().strftime('%Y%m%d')}",
+                    export_format="txt"
+                )
 
 
 elif page == "⚙️ 数据管理与版本":

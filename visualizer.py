@@ -1578,3 +1578,370 @@ def plot_surface_significance_chart(surface_result: Dict[str, Any],
     )
 
     return fig
+
+
+def plot_age_depth_scatter(dating_points: pd.DataFrame,
+                            model_result: Dict[str, Any] = None,
+                            title: str = "年龄-深度关系图") -> go.Figure:
+    fig = go.Figure()
+
+    if not dating_points.empty:
+        valid_points = dating_points[dating_points.get("is_valid", 1) == 1]
+        anomaly_points = dating_points[dating_points.get("is_anomaly", 0) == 1]
+        invalid_points = dating_points[dating_points.get("is_valid", 1) == 0]
+
+        if not valid_points.empty:
+            normal_points = valid_points[valid_points.get("is_anomaly", 0) == 0]
+            if not normal_points.empty:
+                fig.add_trace(go.Scatter(
+                    x=normal_points["age"],
+                    y=normal_points["depth"],
+                    mode="markers",
+                    marker=dict(size=12, color="#2d5f8f", symbol="circle",
+                                line=dict(width=2, color="black")),
+                    name="有效年代点",
+                    text=normal_points.apply(lambda r: (
+                        f"深度: {r['depth']:.1f} cm<br>"
+                        f"年龄: {r['age']:.1f} a BP<br>"
+                        f"方法: {r.get('dating_method', 'N/A')}<br>"
+                        f"标签: {r.get('sample_label', 'N/A')}"
+                    ), axis=1),
+                    hoverinfo="text",
+                ))
+
+            if not anomaly_points.empty:
+                fig.add_trace(go.Scatter(
+                    x=anomaly_points["age"],
+                    y=anomaly_points["depth"],
+                    mode="markers",
+                    marker=dict(size=14, color="#dc3545", symbol="triangle-up",
+                                line=dict(width=2, color="darkred")),
+                    name="异常年代点",
+                    text=anomaly_points.apply(lambda r: (
+                        f"深度: {r['depth']:.1f} cm<br>"
+                        f"年龄: {r['age']:.1f} a BP<br>"
+                        f"异常原因: {r.get('anomaly_reason', 'N/A')}"
+                    ), axis=1),
+                    hoverinfo="text",
+                ))
+
+        if not invalid_points.empty:
+            fig.add_trace(go.Scatter(
+                x=invalid_points["age"],
+                y=invalid_points["depth"],
+                mode="markers",
+                marker=dict(size=10, color="#6c757d", symbol="x",
+                            line=dict(width=2, color="black")),
+                name="已排除/无效",
+                text=invalid_points.apply(lambda r: (
+                    f"深度: {r['depth']:.1f} cm<br>"
+                    f"年龄: {r['age']:.1f} a BP"
+                ), axis=1),
+                hoverinfo="text",
+            ))
+
+    if model_result and model_result.get("success"):
+        import chronology_engine as ce
+        max_depth = max(dating_points["depth"].max() * 1.1, 10) if not dating_points.empty else 100
+        depths = np.linspace(0, max_depth, 200)
+        ages = ce.predict_age_batch(model_result, depths)
+
+        valid_mask = ~np.isnan(ages)
+        if valid_mask.any():
+            model_type_name = {
+                "linear": "线性拟合",
+                "polynomial_2": "二次多项式",
+                "polynomial_3": "三次多项式",
+                "spline": "样条插值",
+                "linear_segmented": "分段线性",
+            }.get(model_result["model_type"], model_result["model_type"])
+
+            label = f"{model_type_name}"
+            r2 = model_result.get("r_squared")
+            rmse = model_result.get("rmse")
+            if r2 is not None:
+                label += f" (R²={r2:.3f}"
+                if rmse is not None:
+                    label += f", RMSE={rmse:.1f}"
+                label += ")"
+
+            fig.add_trace(go.Scatter(
+                x=ages[valid_mask],
+                y=depths[valid_mask],
+                mode="lines",
+                line=dict(color="#e67e22", width=3),
+                name=label,
+            ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="年龄 (a BP)",
+        yaxis_title="深度 (cm)",
+        yaxis=dict(autorange="reversed"),
+        height=600,
+        width=700,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+
+    return fig
+
+
+def plot_sedimentation_rate(rates_df: pd.DataFrame,
+                             title: str = "沉积速率垂直分布图") -> go.Figure:
+    if rates_df.empty:
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    fig = go.Figure()
+
+    for _, row in rates_df.iterrows():
+        fig.add_trace(go.Bar(
+            x=[row["sedimentation_rate"]],
+            y=[-(row["depth_start"] + row["depth_end"]) / 2],
+            width=row["thickness"] * 0.8,
+            orientation="h",
+            marker_color="#2d5f8f",
+            marker_line_color="black",
+            marker_line_width=1,
+            name=row.get("layer_name", ""),
+            showlegend=False,
+            text=f"{row['sedimentation_rate']:.2f} cm/ka",
+            textposition="auto",
+            hovertext=(
+                f"层位: {row.get('layer_name', 'N/A')}<br>"
+                f"深度: {row['depth_start']:.1f} - {row['depth_end']:.1f} cm<br>"
+                f"年龄: {row['age_start']:.1f} - {row['age_end']:.1f} a BP<br>"
+                f"时长: {row['age_duration']:.1f} a<br>"
+                f"厚度: {row['thickness']:.1f} cm<br>"
+                f"沉积速率: {row['sedimentation_rate']:.2f} cm/ka"
+            ),
+            hoverinfo="text",
+        ))
+
+    avg_rate = rates_df["sedimentation_rate"].mean()
+    fig.add_vline(x=avg_rate, line_dash="dash", line_color="#e67e22",
+                  annotation_text=f"平均: {avg_rate:.2f} cm/ka",
+                  annotation_position="top")
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="沉积速率 (cm/ka)",
+        yaxis_title="深度 (cm)",
+        height=600,
+        width=600,
+    )
+
+    return fig
+
+
+def plot_time_section(layers_df: pd.DataFrame,
+                       model_result: Dict[str, Any],
+                       title: str = "时间剖面图") -> go.Figure:
+    if layers_df.empty or not model_result.get("success"):
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据或模型未建立)")
+        return fig
+
+    import chronology_engine as ce
+
+    fig = go.Figure()
+
+    for _, row in layers_df.iterrows():
+        d_start = row["depth_start"]
+        d_end = row["depth_end"]
+        a_start = ce.predict_age(model_result, float(d_start))
+        a_end = ce.predict_age(model_result, float(d_end))
+
+        if a_start is None or a_end is None:
+            continue
+
+        thickness = a_end - a_start
+        if thickness <= 0:
+            continue
+
+        color = _get_layer_color(row["layer_name"])
+
+        fig.add_trace(go.Bar(
+            x=[1],
+            y=[-thickness],
+            base=[-a_start],
+            orientation="v",
+            marker_color=color,
+            marker_line_color="black",
+            marker_line_width=1,
+            width=0.8,
+            name=row["layer_name"],
+            legendgroup=row["layer_name"],
+            showlegend=(row["layer_name"] not in [t.name for t in fig.data if hasattr(t, "name")]),
+            hovertext=(
+                f"层位: {row['layer_name']}<br>"
+                f"深度: {d_start:.1f} - {d_end:.1f} cm<br>"
+                f"年龄: {a_start:.1f} - {a_end:.1f} a BP<br>"
+                f"时长: {thickness:.1f} a<br>"
+                f"砾石: {row.get('gravel_pct', 0):.1f}%<br>"
+                f"砂: {row.get('sand_pct', 0):.1f}%<br>"
+                f"粉砂: {row.get('silt_pct', 0):.1f}%<br>"
+                f"黏土: {row.get('clay_pct', 0):.1f}%"
+            ),
+            hoverinfo="text",
+        ))
+
+    fig.update_layout(
+        title=title,
+        barmode="stack",
+        xaxis=dict(showticklabels=False, range=[0.5, 1.5]),
+        yaxis=dict(title="年龄 (a BP)"),
+        showlegend=True,
+        height=600,
+        width=500,
+    )
+
+    return fig
+
+
+def plot_multi_station_sedimentation(comparison_df: pd.DataFrame,
+                                      title: str = "多站位沉积演化速率对比") -> go.Figure:
+    if comparison_df.empty:
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    fig = go.Figure()
+
+    sample_codes = comparison_df["sample_code"].unique()
+    colors = px.colors.qualitative.Plotly
+
+    for idx, code in enumerate(sample_codes):
+        core_data = comparison_df[comparison_df["sample_code"] == code]
+        color = colors[idx % len(colors)]
+
+        x_vals = []
+        y_vals = []
+        for _, row in core_data.iterrows():
+            x_vals.extend([row["age_start"], row["age_end"], row["age_end"], None])
+            y_vals.extend([row["sedimentation_rate"], row["sedimentation_rate"], None, None])
+
+        station = row.get("station_code", "")
+        label = f"{station}-{code}" if station else code
+
+        fig.add_trace(go.Scatter(
+            x=x_vals,
+            y=y_vals,
+            mode="lines",
+            line=dict(color=color, width=3),
+            name=label,
+            fill="tozeroy",
+            fillcolor=f"rgba{tuple(int(color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4)) + (0.2,)}",
+        ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="年龄 (a BP)",
+        yaxis_title="沉积速率 (cm/ka)",
+        xaxis=dict(autorange="reversed"),
+        height=500,
+        width=900,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+
+    return fig
+
+
+def plot_temporal_layer_comparison(comparison_df: pd.DataFrame,
+                                    title: str = "层位时间对比图") -> go.Figure:
+    if comparison_df.empty:
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    fig = go.Figure()
+
+    for idx, row in comparison_df.iterrows():
+        if row["age_a"] is None or row["age_b"] is None:
+            continue
+
+        color = "#28a745" if abs(row["age_diff"]) < 500 else "#ffc107" if abs(row["age_diff"]) < 2000 else "#dc3545"
+
+        fig.add_trace(go.Scatter(
+            x=[row["age_a"], row["age_b"]],
+            y=[1, 2],
+            mode="lines+markers",
+            line=dict(color=color, width=3),
+            marker=dict(size=12, color=color, symbol=["circle", "square"]),
+            showlegend=False,
+            hovertext=(
+                f"柱样A: {row['layer_a']}<br>"
+                f"年龄A: {row['age_a']:.1f} a BP<br>"
+                f"柱样B: {row['layer_b']}<br>"
+                f"年龄B: {row['age_b']:.1f} a BP<br>"
+                f"年龄差: {row['age_diff']:.1f} a"
+            ),
+            hoverinfo="text",
+        ))
+
+    fig.add_hline(y=1, line_dash="dash", line_color="gray")
+    fig.add_hline(y=2, line_dash="dash", line_color="gray")
+
+    fig.add_annotation(x=0.5, y=1, text="柱样 A", showarrow=False, yshift=20, font=dict(size=14))
+    fig.add_annotation(x=0.5, y=2, text="柱样 B", showarrow=False, yshift=20, font=dict(size=14))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="年龄 (a BP)",
+        yaxis=dict(showticklabels=False, range=[0.5, 2.5]),
+        xaxis=dict(autorange="reversed"),
+        height=400,
+        width=800,
+    )
+
+    return fig
+
+
+def plot_chronology_stats(chronology_summary: pd.DataFrame,
+                           title: str = "年代约束统计概览") -> go.Figure:
+    if chronology_summary.empty:
+        fig = go.Figure()
+        fig.update_layout(title=title + " (无数据)")
+        return fig
+
+    fig = make_subplots(
+        rows=1, cols=3,
+        subplot_titles=["年代点数量", "模型数量", "平均沉积速率 (cm/ka)"],
+    )
+
+    fig.add_trace(go.Bar(
+        x=chronology_summary["sample_code"],
+        y=chronology_summary["dating_point_count"],
+        marker_color="#2d5f8f",
+        text=chronology_summary["dating_point_count"],
+        textposition="outside",
+        name="年代点数",
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        x=chronology_summary["sample_code"],
+        y=chronology_summary["model_count"],
+        marker_color="#e67e22",
+        text=chronology_summary["model_count"],
+        textposition="outside",
+        name="模型数",
+    ), row=1, col=2)
+
+    rate_vals = chronology_summary["avg_sedimentation_rate"].fillna(0)
+    fig.add_trace(go.Bar(
+        x=chronology_summary["sample_code"],
+        y=rate_vals,
+        marker_color=["#28a745" if v > 0 else "#6c757d" for v in rate_vals],
+        text=[f"{v:.1f}" if v > 0 else "N/A" for v in rate_vals],
+        textposition="outside",
+        name="平均速率",
+    ), row=1, col=3)
+
+    fig.update_layout(
+        title=title,
+        height=450,
+        showlegend=False,
+    )
+
+    return fig

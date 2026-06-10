@@ -208,6 +208,8 @@ def init_db() -> None:
     conn.commit()
     conn.close()
 
+    init_chronology_tables()
+
 
 def _migrate_existing_tables(cursor: sqlite3.Cursor) -> None:
     try:
@@ -906,3 +908,329 @@ def get_annotation_dicts(alignment_id: int, annotation_type: str = None) -> List
     if df.empty:
         return []
     return df.to_dict("records")
+
+
+def init_chronology_tables() -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS dating_points (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            core_id INTEGER NOT NULL,
+            depth REAL NOT NULL,
+            age REAL NOT NULL,
+            age_error REAL,
+            dating_method TEXT,
+            sample_label TEXT,
+            is_anomaly INTEGER DEFAULT 0,
+            anomaly_reason TEXT,
+            is_valid INTEGER DEFAULT 1,
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (core_id) REFERENCES core_samples(id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS age_depth_models (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            core_id INTEGER NOT NULL,
+            model_name TEXT NOT NULL,
+            model_type TEXT NOT NULL,
+            model_params TEXT,
+            r_squared REAL,
+            rmse REAL,
+            is_manual INTEGER DEFAULT 0,
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (core_id) REFERENCES core_samples(id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sedimentation_rates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            core_id INTEGER NOT NULL,
+            model_id INTEGER,
+            depth_start REAL NOT NULL,
+            depth_end REAL NOT NULL,
+            age_start REAL NOT NULL,
+            age_end REAL NOT NULL,
+            sedimentation_rate REAL NOT NULL,
+            rate_unit TEXT DEFAULT 'cm/ka',
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (core_id) REFERENCES core_samples(id),
+            FOREIGN KEY (model_id) REFERENCES age_depth_models(id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chronology_annotations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            core_id INTEGER NOT NULL,
+            model_id INTEGER,
+            annotation_type TEXT NOT NULL,
+            target_type TEXT DEFAULT 'model',
+            target_id INTEGER,
+            content TEXT NOT NULL,
+            author TEXT DEFAULT 'geologist',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (core_id) REFERENCES core_samples(id),
+            FOREIGN KEY (model_id) REFERENCES age_depth_models(id)
+        )
+    """)
+
+    _migrate_chronology_tables(cursor)
+
+    conn.commit()
+    conn.close()
+
+
+def _migrate_chronology_tables(cursor: sqlite3.Cursor) -> None:
+    try:
+        cursor.execute("PRAGMA table_info(dating_points)")
+        columns = [col["name"] for col in cursor.fetchall()]
+        new_columns = [
+            ("dating_method", "TEXT"),
+            ("sample_label", "TEXT"),
+            ("is_anomaly", "INTEGER DEFAULT 0"),
+            ("anomaly_reason", "TEXT"),
+            ("is_valid", "INTEGER DEFAULT 1"),
+            ("updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+        ]
+        for col_name, col_def in new_columns:
+            if col_name not in columns:
+                cursor.execute(f"ALTER TABLE dating_points ADD COLUMN {col_name} {col_def}")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("PRAGMA table_info(age_depth_models)")
+        columns = [col["name"] for col in cursor.fetchall()]
+        new_columns = [
+            ("r_squared", "REAL"),
+            ("rmse", "REAL"),
+            ("is_manual", "INTEGER DEFAULT 0"),
+            ("updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"),
+        ]
+        for col_name, col_def in new_columns:
+            if col_name not in columns:
+                cursor.execute(f"ALTER TABLE age_depth_models ADD COLUMN {col_name} {col_def}")
+    except sqlite3.OperationalError:
+        pass
+
+
+def add_dating_point(core_id: int, depth: float, age: float, age_error: float = None,
+                     dating_method: str = "", sample_label: str = "", notes: str = "") -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO dating_points
+        (core_id, depth, age, age_error, dating_method, sample_label, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (core_id, depth, age, age_error, dating_method, sample_label, notes))
+    point_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return point_id
+
+
+def update_dating_point(point_id: int, **kwargs) -> None:
+    if not kwargs:
+        return
+    conn = get_connection()
+    cursor = conn.cursor()
+    kwargs["updated_at"] = "CURRENT_TIMESTAMP"
+    set_clause = ", ".join([f"{k} = ?" if k != "updated_at" else f"{k} = CURRENT_TIMESTAMP" for k in kwargs.keys()])
+    params = [v for k, v in kwargs.items() if k != "updated_at"]
+    params.append(point_id)
+    cursor.execute(f"UPDATE dating_points SET {set_clause} WHERE id = ?", params)
+    conn.commit()
+    conn.close()
+
+
+def delete_dating_point(point_id: int) -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM dating_points WHERE id = ?", (point_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_dating_points(core_id: int, valid_only: bool = False) -> pd.DataFrame:
+    conn = get_connection()
+    query = "SELECT * FROM dating_points WHERE core_id = ?"
+    params = [core_id]
+    if valid_only:
+        query += " AND is_valid = 1"
+    query += " ORDER BY depth ASC"
+    df = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return df
+
+
+def get_dating_point(point_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM dating_points WHERE id = ?", (point_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def add_age_depth_model(core_id: int, model_name: str, model_type: str,
+                        model_params: Dict = None, r_squared: float = None,
+                        rmse: float = None, is_manual: int = 0, notes: str = "") -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO age_depth_models
+        (core_id, model_name, model_type, model_params, r_squared, rmse, is_manual, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (core_id, model_name, model_type,
+          json.dumps(model_params) if model_params else None,
+          r_squared, rmse, is_manual, notes))
+    model_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return model_id
+
+
+def update_age_depth_model(model_id: int, **kwargs) -> None:
+    if not kwargs:
+        return
+    conn = get_connection()
+    cursor = conn.cursor()
+    if "model_params" in kwargs and isinstance(kwargs["model_params"], dict):
+        kwargs["model_params"] = json.dumps(kwargs["model_params"])
+    kwargs["updated_at"] = "CURRENT_TIMESTAMP"
+    set_clause = ", ".join([f"{k} = ?" if k != "updated_at" else f"{k} = CURRENT_TIMESTAMP" for k in kwargs.keys()])
+    params = [v for k, v in kwargs.items() if k != "updated_at"]
+    params.append(model_id)
+    cursor.execute(f"UPDATE age_depth_models SET {set_clause} WHERE id = ?", params)
+    conn.commit()
+    conn.close()
+
+
+def delete_age_depth_model(model_id: int) -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM sedimentation_rates WHERE model_id = ?", (model_id,))
+    cursor.execute("DELETE FROM chronology_annotations WHERE model_id = ?", (model_id,))
+    cursor.execute("DELETE FROM age_depth_models WHERE id = ?", (model_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_age_depth_models(core_id: int) -> pd.DataFrame:
+    conn = get_connection()
+    df = pd.read_sql_query(
+        "SELECT * FROM age_depth_models WHERE core_id = ? ORDER BY created_at DESC",
+        conn, params=(core_id,)
+    )
+    conn.close()
+    return df
+
+
+def get_age_depth_model(model_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM age_depth_models WHERE id = ?", (model_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        result = dict(row)
+        if result.get("model_params"):
+            try:
+                result["model_params"] = json.loads(result["model_params"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return result
+    return None
+
+
+def add_sedimentation_rate(core_id: int, model_id: int, depth_start: float,
+                           depth_end: float, age_start: float, age_end: float,
+                           sedimentation_rate: float, rate_unit: str = "cm/ka",
+                           notes: str = "") -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO sedimentation_rates
+        (core_id, model_id, depth_start, depth_end, age_start, age_end,
+         sedimentation_rate, rate_unit, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (core_id, model_id, depth_start, depth_end, age_start, age_end,
+          sedimentation_rate, rate_unit, notes))
+    rate_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return rate_id
+
+
+def delete_sedimentation_rates(model_id: int) -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM sedimentation_rates WHERE model_id = ?", (model_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_sedimentation_rates(model_id: int = None, core_id: int = None) -> pd.DataFrame:
+    conn = get_connection()
+    query = "SELECT * FROM sedimentation_rates WHERE 1=1"
+    params = []
+    if model_id:
+        query += " AND model_id = ?"
+        params.append(model_id)
+    if core_id:
+        query += " AND core_id = ?"
+        params.append(core_id)
+    query += " ORDER BY depth_start ASC"
+    df = pd.read_sql_query(query, conn, params=params if params else None)
+    conn.close()
+    return df
+
+
+def add_chronology_annotation(core_id: int, annotation_type: str, content: str,
+                              model_id: int = None, target_type: str = "model",
+                              target_id: int = None, author: str = "geologist") -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO chronology_annotations
+        (core_id, model_id, annotation_type, target_type, target_id, content, author)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (core_id, model_id, annotation_type, target_type, target_id, content, author))
+    anno_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return anno_id
+
+
+def get_chronology_annotations(core_id: int = None, model_id: int = None) -> pd.DataFrame:
+    conn = get_connection()
+    query = "SELECT * FROM chronology_annotations WHERE 1=1"
+    params = []
+    if core_id:
+        query += " AND core_id = ?"
+        params.append(core_id)
+    if model_id:
+        query += " AND model_id = ?"
+        params.append(model_id)
+    query += " ORDER BY created_at DESC"
+    df = pd.read_sql_query(query, conn, params=params if params else None)
+    conn.close()
+    return df
+
+
+def delete_chronology_annotation(anno_id: int) -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM chronology_annotations WHERE id = ?", (anno_id,))
+    conn.commit()
+    conn.close()
